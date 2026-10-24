@@ -9,14 +9,24 @@ set -u
 OUT=/data/local/tmp/vermeer-dump
 rm -rf "$OUT" "$OUT.tgz"
 mkdir -p "$OUT"
-DT=/proc/device-tree
+# /proc/device-tree is a symlink on vermeer: use the real target and copy
+# with -L so the dump contains the tree, not a dangling link.
+if [ -d /sys/firmware/devicetree/base ]; then
+	DT=/sys/firmware/devicetree/base
+else
+	DT=/proc/device-tree
+fi
 
 # 1. The live device tree: memory banks, reserved-memory (splash region),
 #    UFS host node, touch controller, PMIC GPIOs, panel DSI node.
-if cp -r "$DT" "$OUT/live-dt" 2>/dev/null; then
+# Prefer the raw FDT blob when the kernel exposes it (best --live-fdt input).
+if [ -f /sys/firmware/fdt ]; then
+	cp /sys/firmware/fdt "$OUT/live.dtb"
+fi
+if cp -rL "$DT" "$OUT/live-dt" 2>/dev/null; then
 	chmod -R u+rw "$OUT/live-dt"
 else
-	(cd "$DT" && tar cf "$OUT/live-dt.tar" .)
+	(cd "$DT" && tar cfh "$OUT/live-dt.tar" .)
 fi
 
 # 2. Kernel's view of the memory map and reservations.
@@ -42,7 +52,7 @@ done
 
 # 5. Touch / buttons nodes, decoded as hex so nothing is lost in the pull.
 {
-	find "$DT" -name '*touch*' -o -name '*fts*' -o -name '*goodix*' \
+	find -L "$DT" -name '*touch*' -o -name '*fts*' -o -name '*goodix*' \
 		-o -name '*novatek*' -o -name '*synaptics*' -o -name '*pon*' \
 		-o -name '*gpio-keys*' -o -name '*qup*' -o -name '*geni*'
 } | sort > "$OUT/node-list.txt"
