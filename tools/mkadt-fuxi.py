@@ -205,7 +205,10 @@ def main():
         PHYS_BASE, BANK_SIZE = args.phys_base, args.bank_size
         FB, FB_SIZE = args.fb_base, args.fb_size
         MODEL_KEY = (args.model_key or args.board).encode()
-        BOARD_COMPATIBLE = f'xiaomi,{args.board}\0'.encode()
+        # The in-tree FUXI kernel's platform expert matches only 'xiaomi,fuxi'
+        # (0016 + 0082); patch 0110 adds native vermeer matching. Keep the fuxi
+        # key as an alias until every deployed kernel carries 0110.
+        BOARD_COMPATIBLE = f'xiaomi,{args.board}\0xiaomi,fuxi\0'.encode()
     elif any(v is not None for v in (args.phys_base, args.bank_size, args.fb_base, args.fb_size)):
         ap.error('explicit geometry overrides are only valid with a non-default --board')
     GPU_BASE = PHYS_BASE + BANK_SIZE - GPU_SIZE

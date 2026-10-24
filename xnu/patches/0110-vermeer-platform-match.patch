@@ -1,0 +1,15 @@
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -39,7 +39,12 @@
+     "     'IOClass'         = SweetPlatformExpert;"
+     "     'IOProviderClass' = IOPlatformExpertDevice;"
+ #if defined(FUXI)
+     "     'IONameMatch'     = 'xiaomi,fuxi';"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetPlatformExpert;"
++    "     'IOProviderClass' = IOPlatformExpertDevice;"
++    "     'IONameMatch'     = 'xiaomi,vermeer';"
+ #else
+     "     'IONameMatch'     = 'xiaomi,sweet';"
+ #endif
