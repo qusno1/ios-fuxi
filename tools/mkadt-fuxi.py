@@ -31,6 +31,11 @@ MEM_SIZE = BANK_SIZE - GPU_SIZE
 LEGACY_SIZE = 0x40000000
 FB, FB_SIZE = 0xb8000000, 0x02b00000
 GICD, GICR, GICR_SIZE = 0x17100000, 0x17180000, 0x200000
+# Board identity: the model keyword the live FDT must contain, and the board
+# entry appended to /compatible. Ports override these plus the geometry above
+# from their own measured live FDT (see --board and the --*-base/--*-size args).
+MODEL_KEY = b'fuxi'
+BOARD_COMPATIBLE = b'xiaomi,fuxi\0'
 
 
 def setprop(node, name, value):
@@ -43,8 +48,8 @@ def validate_live(path, ufs_readonly=False):
     fdt = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fdt)
     nodes, reservations, _ = fdt.parse(path.read_bytes())
-    if b'fuxi' not in nodes['/'].get('model', b'').lower():
-        raise ValueError('live FDT does not identify a Fuxi board')
+    if MODEL_KEY not in nodes['/'].get('model', b'').lower():
+        raise ValueError(f'live FDT does not identify a {MODEL_KEY.decode()} board')
     memory = nodes.get('/memory', {}).get('reg', b'')
     if len(memory) % 16:
         raise ValueError('unexpected /memory cell layout')
@@ -97,7 +102,7 @@ def build(ufs_readonly=False, root_props=(), smp=False, gpu_reserve=False, mem_s
     mkadt.FB, mkadt.FB_SIZE = FB, FB_SIZE
     mkadt.VTIMER_INTID = 27
     root = mkadt.build(highmem=True)
-    setprop(root, 'compatible', b'D22AP\0iPhone10,3\0xiaomi,fuxi\0qcom,sm8550\0AppleARM\0')
+    setprop(root, 'compatible', b'D22AP\0iPhone10,3\0' + BOARD_COMPATIBLE + b'qcom,sm8550\0AppleARM\0')
     if ufs_readonly:
         ufs=next(n for n in root.children if n.name=='sweet-ufs')
         setprop(ufs,'name',b'fuxi-ufs\0')
@@ -182,7 +187,29 @@ def main():
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
+    ap.add_argument('--board', choices=('fuxi', 'vermeer'), default='fuxi',
+                    help='vermeer = Redmi K70 / POCO F6 Pro (SM8550); requires the measured geometry overrides')
+    ap.add_argument('--phys-base', type=lambda s: int(s, 0), help='XNU RAM base (hex) from the measured live FDT')
+    ap.add_argument('--bank-size', type=lambda s: int(s, 0), help='contiguous RAM bank size (hex)')
+    ap.add_argument('--fb-base', type=lambda s: int(s, 0), help='splash reservation base (hex)')
+    ap.add_argument('--fb-size', type=lambda s: int(s, 0), help='splash reservation size (hex)')
+    ap.add_argument('--model-key', help='keyword the live FDT /model must contain (default: the board name)')
     args = ap.parse_args()
+
+    global PHYS_BASE, BANK_SIZE, GPU_BASE, MEM_SIZE, FB, FB_SIZE, MODEL_KEY, BOARD_COMPATIBLE
+    if args.board != 'fuxi':
+        missing = [n for n, v in (('phys-base', args.phys_base), ('bank-size', args.bank_size),
+                                  ('fb-base', args.fb_base), ('fb-size', args.fb_size)) if v is None]
+        if missing:
+            ap.error(f'--board {args.board} needs measured values for: {", ".join(missing)}')
+        PHYS_BASE, BANK_SIZE = args.phys_base, args.bank_size
+        FB, FB_SIZE = args.fb_base, args.fb_size
+        MODEL_KEY = (args.model_key or args.board).encode()
+        BOARD_COMPATIBLE = f'xiaomi,{args.board}\0'.encode()
+    elif any(v is not None for v in (args.phys_base, args.bank_size, args.fb_base, args.fb_size)):
+        ap.error('explicit geometry overrides are only valid with a non-default --board')
+    GPU_BASE = PHYS_BASE + BANK_SIZE - GPU_SIZE
+    MEM_SIZE = BANK_SIZE - GPU_SIZE
     mem_size = MEM_SIZE if args.ram_layout == 'full' else LEGACY_SIZE
     try:
         root_props = ()

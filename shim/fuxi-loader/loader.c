@@ -12,6 +12,12 @@ uint32_t probe_fdt_bytes(void);
 #define BOOT_LINE_LENGTH	608
 #define PAGE_16K		0x4000UL
 
+/* XNU RAM window, Fuxi-measured. A port overrides the whole geometry
+ * (XNU_PHYS_BASE plus the gpu-handoff.h bank macros) with -D. */
+#ifndef XNU_PHYS_BASE
+#define XNU_PHYS_BASE	0x8c0000000ULL
+#endif
+
 struct payload_seg {
 	uint64_t vmaddr, vmsize, file_off, file_size;
 };
@@ -110,7 +116,7 @@ static const char *loader_boot(void)
      p->nsegs == 0 || p->nsegs > 32 ||
      length < sizeof(*p) + p->nsegs * sizeof(struct payload_seg))
   return "bad embedded payload header";
- if (p->phys_base != 0x8c0000000ULL || (p->mem_size != 0x40000000ULL && p->mem_size != FG_RAM_SIZE) ||
+ if (p->phys_base != XNU_PHYS_BASE || (p->mem_size != 0x40000000ULL && p->mem_size != FG_RAM_SIZE) ||
      (p->virt_base & (0x2000000-1)) || (p->kernel_end & (PAGE_16K-1)) ||
      p->kernel_end < p->virt_base ||
      p->kernel_end - p->virt_base > p->mem_size - 2*PAGE_16K ||

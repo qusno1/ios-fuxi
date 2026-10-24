@@ -1,14 +1,25 @@
 #pragma once
 #include <stdint.h>
 
+/* Board geometry, Fuxi-measured defaults. A port supplies its own measured
+ * values with -D on the loader build (never guessed): FB_BASE comes from the
+ * live FDT splash reservation, FB_W/FB_H from the panel. */
+#ifndef FB_BASE
 #if defined(FUXI)
 #define FB_BASE 0xb8000000UL /* live Fuxi splash reservation */
 #else
 #define FB_BASE		0x9c000000UL	/* reserved-memory cont_splash_region */
 #endif
+#endif
+#ifndef FB_W
 #define FB_W		1080
+#endif
+#ifndef FB_H
 #define FB_H		2400
+#endif
+#ifndef FB_STRIDE
 #define FB_STRIDE	(FB_W * 4)	/* a8r8g8b8, matches mainline simplefb */
+#endif
 
 #define RED	0xffff0000U
 #define BLUE	0xff0000a0U
