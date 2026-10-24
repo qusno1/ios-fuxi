@@ -87,9 +87,13 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
 FWPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
-printf '.section .payload,"a"\n.incbin "%s"\n' "$payload" > "$out/payload.S"
+# Native-Windows clang cannot open MSYS virtual paths written into .S files;
+# cygpath -m rewrites them to drive-letter form (no-op on Linux).
+incbin_path() { command -v cygpath >/dev/null && cygpath -m "$1" || printf '%s' "$1"; }
+printf '.section .payload,"a"\n.incbin "%s"\n' "$(incbin_path "$payload")" > "$out/payload.S"
 flags=(--target=aarch64-none-elf -O2 -ffreestanding -fno-builtin -nostdlib
        -fno-pic -fno-stack-protector -mgeneral-regs-only -mstrict-align -Wall -Wextra -Werror -DFUXI=1 -DFUXI_XNU_LOADER=1 -I..
+       -Wno-unterminated-string-initialization # clang>=18: probe code uses fixed-size nonstring names
        ${board_cflags[@]+"${board_cflags[@]}"})
 for source in start.S loader.c ../console.c ../fuxi-probe/probe.c; do
  name=$(basename "${source%.*}")
