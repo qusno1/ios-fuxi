@@ -59,9 +59,9 @@ PY
 # Required pinned firmware input; only the ignored build directory receives bytes.
 # The zap shader is device-specific: a port supplies ZAP_SHA256 (64 hex) of its
 # own measured zap consciously; GMU/SQE stay pinned to the verified SM8550 set.
-python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" "${ZAP_SHA256:-86e4c3f61d4ddbe581405f4cc496182cf385bee39aaefec61639a31d3619fd35}" <<'FWPY'
+python3 - "$payload" "${FUXI_GMU_FIRMWARE:-}" "${FUXI_SQE_FIRMWARE:-}" "${FUXI_GPU_ZAP_MBN:-}" "$out/gpu-fw.S" "$out/gpu-fw-sizes.json" "${ZAP_SHA256:-86e4c3f61d4ddbe581405f4cc496182cf385bee39aaefec61639a31d3619fd35}" <<'FWPY'
 import hashlib, json, pathlib, re, struct, sys
-payload, gmu, sqe, zap, dst, zap_pin = sys.argv[1:]
+payload, gmu, sqe, zap, dst, sizes_dst, zap_pin = sys.argv[1:]
 assert re.fullmatch(r'[0-9a-f]{64}', zap_pin), 'ZAP_SHA256 must be 64 lowercase hex'
 reserved = True  # Both supported windows exclude top-of-bank scratch.
 pinned = {
@@ -70,6 +70,7 @@ pinned = {
  "zap": zap_pin,
 }
 lines = ['.section .gpu_fw,"a"']
+sizes = {}
 for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
     lines += ['.balign 4', f'.global _{name}_fw_start', f'_{name}_fw_start:']
     if src:
@@ -83,8 +84,10 @@ for src, name in ((gmu, 'gpu'), (sqe, 'sqe'), (zap, 'zap')):
         if name == 'zap':
             assert size <= 0x10000, 'zap MBN exceeds parser bound'
         lines.append('.incbin ' + json.dumps(str(path)))
+    sizes[name] = (size + 3) & ~3
     lines += [f'.global _{name}_fw_end', f'_{name}_fw_end:']
 pathlib.Path(dst).write_text('\n'.join(lines) + '\n')
+pathlib.Path(sizes_dst).write_text(json.dumps(sizes))
 FWPY
 # incbin avoids C absolute pointers in an Image loaded at an arbitrary PA.
 # Native-Windows clang cannot open MSYS virtual paths written into .S files;
@@ -105,12 +108,18 @@ done
 "$CLANG" "${flags[@]}" -c "$out/payload.S" -o "$out/payload.o"
 "$CLANG" "${flags[@]}" -c "$out/gpu-fw.S" -o "$out/gpu-fw.o"
 "$LLD" -T loader.ld --build-id=none "$out/start.o" "$out/loader.o" "$out/console.o" "$out/probe.o" "$out/gpu-fw.o" "$out/payload.o" -o "$out/loader.elf"
-python3 - "$out/loader.elf" "$READELF" <<'GPUCHECK'
-import re, subprocess, sys
+# The section must be exactly the sum of the (4-aligned) firmware inputs; the
+# Fuxi set additionally keeps the historical 0x25ac8 pin.
+python3 - "$out/loader.elf" "$READELF" "$out/gpu-fw-sizes.json" "$BOARD" <<'GPUCHECK'
+import json, re, subprocess, sys
 sections = subprocess.check_output([sys.argv[2], '-SW', sys.argv[1]], text=True)
 match = re.search(r'\.gpu_fw\s+PROGBITS\s+[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+([0-9a-fA-F]+)', sections)
-assert match and int(match[1], 16) == 0x25ac8, 'loader .gpu_fw must be exactly 0x25ac8 bytes'
-print('Verified loader .gpu_fw size 0x25ac8')
+expected = sum(json.load(open(sys.argv[3])).values())
+assert match and int(match.group(1), 16) == expected, \
+    f'loader .gpu_fw must be exactly {expected:#x} bytes'
+if sys.argv[4] == 'fuxi':
+    assert expected == 0x25ac8, 'Fuxi firmware set changed'
+print(f'Verified loader .gpu_fw size {expected:#x}')
 GPUCHECK
 "$OBJCOPY" -O binary "$out/loader.elf" "$out/Image"
 python3 - "$out/Image" <<'PY'
@@ -120,6 +129,7 @@ b=Path(sys.argv[1]).read_bytes()
 assert struct.unpack_from('<Q',b,16)[0]==len(b), 'Image size must cover embedded payload'
 assert b[56:60]==b'ARM\x64'
 PY
+img_name="$BOARD-xnu-boot.img"; [ "$BOARD" = fuxi ] && img_name=fuxi-xnu-boot.img
 python3 "$MKBOOTIMG" --header_version 4 --kernel "$out/Image" \
- --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/fuxi-xnu-boot.img"
-ls -lh "$out/Image" "$out/fuxi-xnu-boot.img"
+ --os_version 16.0.0 --os_patch_level 2026-08 -o "$out/$img_name"
+ls -lh "$out/Image" "$out/$img_name"
