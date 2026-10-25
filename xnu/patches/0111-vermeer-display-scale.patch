@@ -1,0 +1,71 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3ba8409..427b3e5 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -128,6 +128,7 @@ public:
+ 	uint64_t      fPhys;
+ 	uint32_t      fWidth, fHeight, fRowBytes;
+ 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
++	bool          fScaleMode;               /* vermeer: panel larger than logical */
+ 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -230,6 +231,29 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	fScaleMode = false;
++	{
++		char sz[32];
++		if (PE_parse_boot_argn("sweetfb_logical", sz, sizeof(sz))) {
++			unsigned lw = 0, lh = 0;
++			if (sscanf(sz, "%ux%u", &lw, &lh) == 2 && lw > 0 && lh > 0 &&
++				lw <= SWEET_FB_LOGICAL_W && lh <= SWEET_FB_LOGICAL_H) {
++				fLogicalW = lw;
++				fLogicalH = lh;
++				if (lw < fWidth || lh < fHeight) {
++					fScaleMode = true;
++					fOffX = fOffY = 0;   /* scaled copy fills the whole panel */
++				} else {
++					fOffX = (int32_t)(fLogicalW - fWidth) / 2;
++					fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++				}
++				IOLog("SWEET FB: logical %ux%u scale %d on %ux%u panel\n",
++					fLogicalW, fLogicalH, fScaleMode, fWidth, fHeight);
++			} else {
++				IOLog("SWEET FB: bad sweetfb_logical '%s'\n", sz);
++			}
++		}
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -712,6 +736,28 @@ AppleCLCD::present(const uint8_t *rec)
+ 					    s->memory->getLength() - offset, s->bytesPerRow, w, h);
+ 				} else
+ #endif
++				if (fScaleMode) {
++					/* rects are in logical space; scale to the panel */
++					int32_t pdx = (int32_t)((int64_t)dx * fWidth / fLogicalW);
++					int32_t pdy = (int32_t)((int64_t)dy * fHeight / fLogicalH);
++					int32_t pdw = (int32_t)((int64_t)w * fWidth / fLogicalW);
++					int32_t pdh = (int32_t)((int64_t)h * fHeight / fLogicalH);
++					if (pdx + pdw > (int32_t)fWidth) {
++						pdw = (int32_t)fWidth - pdx;
++					}
++					if (pdy + pdh > (int32_t)fHeight) {
++						pdh = (int32_t)fHeight - pdy;
++					}
++					const uint32_t *sp = (const uint32_t *)(src + s->offset);
++					for (int32_t y = 0; y < pdh && pdw > 0; y++) {
++						int32_t syy = sy + (int32_t)((int64_t)y * h / pdh);
++						uint32_t *dp = (uint32_t *)(fPixels + (uint64_t)(pdy + y) * fRowBytes + (uint64_t)pdx * 4);
++						const uint32_t *sl = sp + (uint64_t)syy * (s->bytesPerRow / 4) + sx;
++						for (int32_t x = 0; x < pdw; x++) {
++							dp[x] = sl[(int32_t)((int64_t)x * w / pdw)];
++						}
++					}
++				} else
+ 				for (int32_t y = 0; y < h; y++) {
+ 					memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 					    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
