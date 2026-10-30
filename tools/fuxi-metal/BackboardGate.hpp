@@ -1,7 +1,12 @@
 /* Boot-scoped crash recovery; no signal handler or mid-context CPU replay. */
 #pragma once
+#include "TransientMemory.hpp"
+#include "SlabMemory.hpp"
 #include "ClientStorage.hpp"
 #include "FrameTrace.hpp"
+#include "SamplingPolicy.hpp"
+#include <array>
+#include <string>
 #include <chrono>
 #include <atomic>
 #include <mutex>
@@ -97,6 +102,10 @@ public:
    else {failed=true;strikes=strikeLimit;bool saved=persistDenied();fprintf(stderr,"FUXI MTL: backboardd gate deny reason=good-write next-respawn=CPU persisted=%u\n",unsigned(saved));}
   }
  }
+ // log2 bucket:count pairs for non-zero buckets, or "-".
+ static std::string classCounts(const std::array<std::atomic<uint64_t>,40> &a){std::string r;char b[40];for(size_t i=0;i<a.size();++i)if(auto v=a[i].load()){snprintf(b,sizeof b,"%s%zu:%llu",r.empty()?"":",",i,(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
+ // name:count pairs for non-zero pool-miss causes, or "-".
+ static std::string causeCounts(){std::string r;char b[48];for(unsigned i=0;i<missCauses;++i)if(auto v=texturePoolMissCause[i].load()){snprintf(b,sizeof b,"%s%s:%llu",r.empty()?"":",",missCauseNames[i],(unsigned long long)v);r+=b;}return r.empty()?"-":r;}
  void report() {
   if(!active.load())return;
   std::lock_guard<std::mutex> guard(mutex);double t=now();if(!active || t-lastReport<5)return;
@@ -106,9 +115,9 @@ public:
   // This is compositor timestamp occupancy, not a whole-engine busy counter.
   double busy=100.0*double(gpu-lastGPU)/1e9/(t-lastReport);if(busy>100.0)busy=100.0;
   if(count && gpu==lastGPU)busy=-1.0; // completed frames without timestamp data
-  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f\n",
+  fprintf(stderr,"FUXI MTL: backboardd frames=%llu gpu_ms=%.3f late=%llu failures=%llu sampling_skipped=%llu hz=%.2f window_frames=%llu gpu_busy_est_pct=%.1f tex_pool_hits=%llu tex_pool_misses=%llu tex_pool_trims=%llu tex_pool_bytes=%llu tex_pool_wasted=%llu tex_pool_idle_trims=%llu tex_pool_pressure_trims=%llu tex_pool_reject_full=%llu tex_pool_reject_budget=%llu tex_pool_class_hits=%s tex_pool_class_misses=%s tex_pool_miss_causes=%s slab_hits=%llu slab_grows=%llu slab_grow_cold=%llu slab_grow_frag=%llu slab_grow_full=%llu slab_grow_refused=%llu slab_frees=%llu slab_trims=%llu slab_bytes=%llu slab_free_bytes=%llu buf_pool_hits=%llu buf_pool_misses=%llu buf_pool_trims=%llu buf_pool_bytes=%llu surface_import_hits=%llu surface_import_misses=%llu\n",
    (unsigned long long)frames,count?(gpu-lastGPU)/1e6/double(count):0.0,(unsigned long long)late,
-   (unsigned long long)failures,double(count)/(t-lastReport),(unsigned long long)count,busy);
+   (unsigned long long)failures,(unsigned long long)skippedSamplingDraws.load(),double(count)/(t-lastReport),(unsigned long long)count,busy,(unsigned long long)texturePoolHits.load(),(unsigned long long)texturePoolMisses.load(),(unsigned long long)texturePoolTrims.load(),(unsigned long long)texturePoolBytes.load(),(unsigned long long)texturePoolWasted.load(),(unsigned long long)texturePoolIdleTrims.load(),(unsigned long long)texturePoolPressureTrims.load(),(unsigned long long)texturePoolRejectFull.load(),(unsigned long long)texturePoolRejectBudget.load(),classCounts(texturePoolClassHits).c_str(),classCounts(texturePoolClassMisses).c_str(),causeCounts().c_str(),(unsigned long long)slabHits.load(),(unsigned long long)slabGrows.load(),(unsigned long long)slabGrowCold.load(),(unsigned long long)slabGrowFrag.load(),(unsigned long long)slabGrowFull.load(),(unsigned long long)slabGrowRefused.load(),(unsigned long long)slabFrees.load(),(unsigned long long)slabTrims.load(),(unsigned long long)slabBytes.load(),(unsigned long long)slabFreeBytes.load(),(unsigned long long)bufferPoolHits.load(),(unsigned long long)bufferPoolMisses.load(),(unsigned long long)bufferPoolTrims.load(),(unsigned long long)bufferPoolBytes.load(),(unsigned long long)surfaceImportHits.load(),(unsigned long long)surfaceImportMisses.load());
   if(systemTranslationPolicy().frameTrace)frameTrace.report();
   lastReport=t;lastFrames=frames;lastGPU=gpu;
  }

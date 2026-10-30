@@ -53,11 +53,12 @@ struct IOMemoryDescriptor {
  void complete(int d) { assert(d==1 && prepared);prepared--; }
 };
 struct SweetSurface {
- unsigned refs=1, gpuWriters=0; bool gpuQuarantined=false;
+ unsigned refs=1, gpuWriters=0; bool gpuQuarantined=false; uint64_t gpuReadyTime=0;
  void retain() { refs++; }
  void release() { assert(refs>1);refs--; }
  IOMemoryDescriptor *memory; unsigned offset=0,pixelFormat=0x42475241,bytesPerRow=4352; };
 static unsigned maps,unmaps,copies;
+static void (*copyHook)();
 static bool ready=true, fail_map=false, fail_unmap=false;
 static int copy_result=2, poll_result=1;
 static int fuxi_gpu_poll(fg_times *) { return poll_result; }
@@ -75,7 +76,7 @@ static int fuxi_gpu_unmap(unsigned slot,fg_times *t) {
 }
 static int fuxi_gpu_copy(unsigned slot,uint64_t generation,uintptr_t,uint64_t,
  unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned,fg_times *) {
- assert(generations[slot]==generation);copies++;
+ assert(generations[slot]==generation);copies++;if(copyHook)copyHook();
  if(copy_result!=2) ready=false;
  return copy_result;
 }

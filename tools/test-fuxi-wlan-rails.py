@@ -48,7 +48,7 @@ static void ts_gpio(unsigned n,unsigned func,unsigned pull,unsigned ma,int out) 
     accessors = '\n'.join(line for line in shim.splitlines()
                           if line.startswith(('static uint8_t wl_cdb8(', 'static uint32_t wl_cdb16(')))
     icc = '/* ---- milestone 6i:' + driver.split('/* ---- milestone 6i:', 1)[1].split('/* ---- end milestone 6i ---- */', 1)[0]
-    runner = 'static void\nfw_run(' + driver.split('static void\nfw_run(', 1)[1].split('static void\nfw_thread(', 1)[0]
+    runner = 'static void wl17_clk_step(void) {} /* P17 SPMI sleep clock: kernel only */\nstatic void\nfw_run(' + driver.split('static void\nfw_run(', 1)[1].split('static void\nfw_thread(', 1)[0]
     # Execute unmodified cases 2 and 3 from the included production loader.
     m3 = 'static uint32_t wl_vrm' + shim.split('static uint32_t wl_vrm', 1)[1].split('static int wl_poll_clr', 1)[0]
     m3 += 'static int rails_m3(unsigned step) { uint32_t *r=wl3_report; switch(step) {\n'

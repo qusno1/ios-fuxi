@@ -25,6 +25,8 @@ register_functions += ''.join(submit.function(actual, n) for n in (
 register_functions = "static uint64_t fp_duty_used(uint64_t);\nstatic void fp_worker_locked(thread_call_param_t,thread_call_param_t);\n" + ''.join(
     submit.function(actual, n) for n in ('fp_compile_domain','fp_compile_failed','fp_compile_cut','fp_compile_forget','fp_compile_poll','fp_compile_admitted','fp_compile_command')) + register_functions
 register_functions += actual[actual.index('static int fp_compile_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern')]
+register_functions += actual[actual.index('static int fp_pressure_sysctl SYSCTL_HANDLER_ARGS'):actual.index('SYSCTL_PROC(_kern, OID_AUTO, fuxipressure')]
+register_functions += submit.function(actual, 'fuxi_perf_start')
 # Audit the loader's zero-based wire slots and execute the host decoder without
 # importing its USB dependencies. The C model below records the governor reads.
 probe = (ROOT/'shim/fuxi-probe/probe.c').read_text()
@@ -111,6 +113,10 @@ int main(void) {
  assert(fp_want_boost(1,1,400,4000,500,3999,1500)); /* swaps extend */
  assert(!fp_want_boost(1,1,400,5500,500,3999,1500));
  assert(!fp_want_boost(0,1,400,2000,2001,0,1500));
+ fp_start=650; /* fuxiperfstart raises only the start threshold */
+ assert(fp_want_boost(0,1,650,2000,1999,0,1500) && !fp_want_boost(0,1,651,2000,1999,0,1500));
+ assert(!fp_want_boost(1,1,681,2000,1999,0,1500));
+ fp_start=600;
  for(unsigned d=0;d<3;d++) {
   fp_percore[d]=1; assert(fp_vote(d,7)); assert(writes[d]==fp_cores[d]);
   fp_percore[d]=0; assert(fp_vote(d,2)); assert(writes[d]==fp_cores[d]+1);
@@ -606,7 +612,78 @@ int main(void) {
  for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=450;
  ticks+=20;fp_worker(0,0);assert(!fp_boosted && !fp_compile_high && bound==-1);
  assert(!fp_compile_command(0,&reply) && reply.state==FC_THERMAL && !refs);
+ /* Pressure policy: inclusive rising trips, exact falling hysteresis,
+  * invalid quorum, predictive latch, lowered thresholds and no sleeping. */
+ assert(FP_TP_NOMINAL==0 && FP_TP_MODERATE==1 && FP_TP_HEAVY==2 && FP_TP_TRAPPING==3 && FP_TP_SLEEPING==4);
+ assert(fp_pressure_level(0,1,619,0,620,680,580)==0);
+ assert(fp_pressure_level(0,1,620,1,620,680,580)==1);
+ assert(fp_pressure_level(0,1,550,1,620,680,580)==1);
+ assert(fp_pressure_level(1,1,581,0,620,680,580)==1);
+ assert(fp_pressure_level(1,1,580,0,620,680,580)==0);
+ assert(fp_pressure_level(0,1,679,1,620,680,580)==1);
+ assert(fp_pressure_level(0,1,680,1,620,680,580)==2);
+ assert(fp_pressure_level(2,1,641,1,620,680,580)==2);
+ assert(fp_pressure_level(2,1,640,1,620,680,580)==1);
+ assert(fp_pressure_level(0,1,769,1,620,680,580)==2);
+ assert(fp_pressure_level(0,1,770,1,620,680,580)==3);
+ assert(fp_pressure_level(3,1,731,1,620,680,580)==3);
+ assert(fp_pressure_level(3,1,730,1,620,680,580)==2);
+ { uint64_t since=0;
+  assert(fp_pressure_hold(-1,0,5,&since,10)==0 && since==5);
+  assert(fp_pressure_hold(0,1,6,&since,10)==1 && since==6);
+  assert(fp_pressure_hold(1,0,15,&since,10)==1 && since==6);
+  assert(fp_pressure_hold(1,2,15,&since,10)==2 && since==15);
+  assert(fp_pressure_hold(2,0,24,&since,10)==2);
+  assert(fp_pressure_hold(2,0,25,&since,10)==0 && since==25);
+  assert(fp_pressure_hold(0,0,26,&since,10)==0 && since==25); }
+ for(int prev=-1;prev<=3;prev++) {
+  assert(fp_pressure_level(prev,0,-400,1,620,680,580)==(prev==3?3:2));
+  assert(fp_pressure_level(prev,1,450,0,620,680,580)==0);
+ }
+ assert(fp_pressure_level(0,1,450,1,400,450,350)==2);
+ assert(fp_pressure_level(2,1,410,1,400,450,350)==1);
+ assert(fp_pressure_level(1,1,350,0,400,450,350)==0);
+ for(int temp=-400;temp<=1500;temp++)for(int prev=-1;prev<=3;prev++)
+  assert(fp_pressure_level(prev,1,temp,temp>=620,620,680,580)<FP_TP_SLEEPING);
+ /* Actual worker leaves pressure untouched with opt-in off. Early reads
+  * return EBUSY, disabled reads ENOTSUP, and no sysctl performs MMIO. */
+ reset();int pressure_out=-99;
+ req=(struct sysctl_req){.oldptr=&pressure_out,.oldlen=sizeof(pressure_out)};
+ assert(fp_pressure_sysctl(&req)==ENOTSUP);
+ fp_worker(0,0);assert(fp_pressure==-1);
+ fp_pressure_enabled=1;assert(fp_pressure_sysctl(&req)==EBUSY);
+ fp_enabled=0;assert(fp_pressure_sysctl(&req)==ENOTSUP);fp_enabled=1;
+ req.newptr=&command;assert(fp_pressure_sysctl(&req)==EPERM);req.newptr=0;
+ fp_worker(0,0);assert(!fp_pressure_sysctl(&req) && pressure_out==0);
+ copyout_error=EFAULT;assert(fp_pressure_sysctl(&req)==EFAULT);copyout_error=0;
+ unsigned reads0=tsens_reads[0],reads1=tsens_reads[1];
+ assert(!fp_pressure_sysctl(&req) && reads0==tsens_reads[0] && reads1==tsens_reads[1]);
+ regs[3][0xa4/4]=(1u<<21)|620;ticks+=20;fp_worker(0,0);
+ assert(fp_blocked && fp_pressure==1);
+ regs[3][0xa4/4]=(1u<<21)|680;ticks+=20;fp_worker(0,0);assert(fp_pressure==2);
+ regs[3][0xa4/4]=(1u<<21)|770;ticks+=20;fp_worker(0,0);assert(fp_pressure==3);
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=450;
+ ticks+=20;fp_worker(0,0);assert(fp_pressure==3); /* loss never relaxes */
+ for(unsigned n=1;n<=5;n++)regs[3][(0xa0+4*n)/4]=(1u<<21)|450;
+ ticks+=20;fp_worker(0,0);assert(fp_pressure==1 && fp_blocked);
+ ticks+=499;fp_worker(0,0);assert(fp_pressure==1);
+ ticks++;fp_worker(0,0);assert(fp_pressure==0 && !fp_blocked);
+ /* Boot arguments: only exact 1 enables; fuxitp alone starts no worker. */
+ reset();fp_enabled=0;arg_name="fuxitp";arg_value=1;fuxi_perf_start();
+ assert(!fp_enabled && !fp_started && !fp_pressure_enabled);
+ reset();fp_enabled=0;arg_name="fuxiperf";arg_value=1;fuxi_perf_start();
+ assert(fp_enabled && fp_started && !fp_pressure_enabled);
+ const unsigned tp_args[]={0,1,2,UINT32_MAX};
+ for(unsigned i=0;i<4;i++) {
+  reset();fp_enabled=0;arg_name="fuxiperf";arg_value=1;
+  arg_name2="fuxitp";arg_value2=tp_args[i];fuxi_perf_start();
+  assert(fp_enabled && fp_started && fp_pressure_enabled==(tp_args[i]==1));
+  assert(fp_pressure==-1); /* start never fabricates a sample */
+  fp_worker(0,0);assert(fp_pressure==(tp_args[i]==1?0:-1));
+ }
+ arg_name=arg_name2=0;
 #undef printf
+ puts("PASS: thermal pressure opt-in, read-only sysctl/readiness/no-MMIO, guard/quorum integration, Apple wire values, rising trips/falling hysteresis and no sleeping");
  puts("PASS: compile gate/default off, prime/gold votes, idle/touch precedence, thermal/quorum/duty cuts, cap, nested limit/no renewal, leave without enter, cross-thread isolation, dead-thread cleanup and balanced references");
  puts("PASS: opt-in idle boundaries, LUT floor/clamp, legacy equivalence, hook wakeups, thermal/duty precedence, stats and transition rate limit");
  puts("PASS: predictive/rise/62C cutoff, 68C ceiling votes within 20ms of 77C step at every phase, sustained ramp, 51-52C load, 500ms hysteresis, rolling 123/200ms duty, boot-arg bounds and actual timer deadlines");
@@ -624,17 +701,18 @@ POLICY_CAPS
 static unsigned maps,fail_map,log_count,observed_tail_fault;
 static unsigned fp_domain_failed[3],fp_applied[3],fp_applied_valid[3];
 static uint64_t ticks,fp_retry_interval,fp_retry_at,fp_retry_end;
-static unsigned fp_attempted,fp_retries,fp_enabled,fp_ready;
+static unsigned fp_attempted,fp_retries,fp_enabled,fp_ready,fp_started;
 static struct { const char *step; unsigned domain,offset; uint64_t pa; uint32_t value; int access,row; } fp_diagnostic;
 static uint64_t fp_input,fp_swap,fp_hold,fp_last,fp_window,fp_window_start,fp_boost_time,fp_boosts;
 static int fp_max_temp,fp_boosted;
 IDLE_GLOBALS
 THERMAL_GLOBALS
-static const char *arg_name;
-static unsigned arg_value;
+static const char *arg_name, *arg_name2;
+static unsigned arg_value, arg_value2;
 static int PE_parse_boot_argn(const char *name,void *value,unsigned size) {
  assert(size==sizeof(unsigned));
  if(arg_name && !strcmp(name,arg_name)) { *(unsigned *)value=arg_value;return 1; }
+ if(arg_name2 && !strcmp(name,arg_name2)) { *(unsigned *)value=arg_value2;return 1; }
  return 0;
 }
 typedef void *thread_call_param_t;
@@ -646,6 +724,11 @@ static int model_sysctl_out(struct sysctl_req *req,const void *in,size_t n){if(c
 #define SYSCTL_IN model_sysctl_in
 #define SYSCTL_OUT model_sysctl_out
 static int fp_call;
+#define THREAD_CALL_PRIORITY_KERNEL 0
+#define THREAD_CALL_OPTIONS_ONCE 1
+static void thread_call_setup_with_options(int *call,void (*worker)(thread_call_param_t,thread_call_param_t),void *arg,int priority,int options) {
+ assert(call==&fp_call && worker && !arg && !priority && options==1);
+}
 typedef uintptr_t thread_t;
 #define THREAD_NULL 0
 static unsigned fp_compile_enabled,fp_compile_high,fp_compile_voted,fp_touch_high,fp_compile_refusals;
@@ -735,9 +818,10 @@ static void reset(void) {
  fp_hot=620;fp_limit=680;fp_resume=580;fp_rise=100;fp_fast_ms=20;fp_rate_ms=20;fp_budget_ms=200;
  fp_idle_ms=fp_idle_floor=fp_idling=0;
  fp_idle_start=fp_idle_entry=fp_idle_time=fp_idle_entries=fp_idle_transitions=0;
- arg_name=0;fp_configure();
+ arg_name=arg_name2=0;fp_configure();
  fp_recover_since=fp_above_time=fp_cuts=fp_active_start=0;
  fp_duty_count=0;fp_prev_temp=fp_prev_valid=fp_blocked=0;
+ fp_pressure_enabled=fp_started=0;fp_pressure=-1;
  fp_rate_elapsed=0;fp_rate_temp=fp_rate_valid=fp_rate=0;
  memset(tsens_reads,0,sizeof(tsens_reads));
  memset(regs,0,sizeof(regs));memset(writes,0,sizeof(writes));memset(lut_reads,0,sizeof(lut_reads));
@@ -779,6 +863,7 @@ for name in ('fuxi_perf.c','fuxi_perf_logic.h','fuxi_compile_abi.h'):
     assert added == (ROOT/'xnu/fuxi-perf'/name).read_text()
 assert '#include "fuxi_compile_sched.h"' in patch
 assert 'CTLFLAG_ANYBODY | CTLFLAG_LOCKED' in actual
+assert 'CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED' in actual
 assert patch.count('+\tfuxi_perf_input();') == 1 and '+\t\t\t\tfuxi_perf_input();' in patch
 with tempfile.TemporaryDirectory() as d:
     source, exe = Path(d)/'perf.c', Path(d)/'perf'

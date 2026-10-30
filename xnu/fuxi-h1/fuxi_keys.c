@@ -399,6 +399,179 @@ fk_script(void *arg, wait_result_t wr)
 }
 
 /*
+ * fuxitouchscript=S: S seconds after the key thread starts, run a fixed
+ * gesture loop through the normal touch HID path, so GPU/UI timing can be
+ * compared between boots without anyone at the phone. Each loop: wake with
+ * Power if the display is off, swipe up from the bottom edge (unlock/home),
+ * three home-page swipes left and three right, pull down Spotlight and go
+ * home, pull down Control Center and go home. fuxitouchscriptn=N loops
+ * (default 10, at most 100). Only for device tests: the touches are synthetic
+ * and finger 0 must not be in use by a real contact.
+ */
+extern void sweet_hid_touch(int finger, int down, int x, int y);
+extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+static unsigned fk_touch_loops = 10;
+
+static void
+fk_swipe(int x0, int y0, int x1, int y1, unsigned ms)
+{
+	unsigned steps = ms / 8u ? ms / 8u : 1u;
+	for (unsigned i = 0; i <= steps; ++i) {
+		int x = x0 + (x1 - x0) * (int)i / (int)steps;
+		int y = y0 + (y1 - y0) * (int)i / (int)steps;
+		fuxi_perf_input();
+		sweet_hid_touch(0, 1, x, y);
+		fk_script_sleep(8);
+	}
+	sweet_hid_touch(0, 0, x1, y1);
+}
+
+static void
+fk_touch_script(void *arg, wait_result_t wr)
+{
+	(void)wr;
+	unsigned delay = (unsigned)(uintptr_t)arg;
+	printf("FUXI TOUCH SCRIPT: starts in %u s, %u loops\n", delay, fk_touch_loops);
+	fk_script_sleep(delay * 1000u);
+	for (unsigned loop = 1; loop <= fk_touch_loops; ++loop) {
+		if (__atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED)) {
+			struct fuxi_key_inject cmd = {0, FUXI_KEY_INJECT_CLICK, 120};
+			(void)fk_inject(&cmd);
+			fk_script_sleep(1500);
+		}
+		printf("FUXI TOUCH SCRIPT: loop %u start\n", loop);
+		fk_swipe(540, 2390, 540, 1100, 250);   /* unlock, or home */
+		fk_script_sleep(2000);
+		for (unsigned i = 0; i < 6; ++i) {
+			if (i < 3) {
+				fk_swipe(900, 1300, 180, 1300, 250);
+			} else {
+				fk_swipe(180, 1300, 900, 1300, 250);
+			}
+			fk_script_sleep(1200);
+		}
+		fk_swipe(540, 900, 540, 1600, 250);    /* Spotlight */
+		fk_script_sleep(1500);
+		fk_swipe(540, 2390, 540, 1100, 250);
+		fk_script_sleep(1500);
+		fk_swipe(1000, 10, 1000, 1100, 250);   /* Control Center */
+		fk_script_sleep(1500);
+		fk_swipe(540, 2390, 540, 1100, 250);
+		fk_script_sleep(1500);
+		printf("FUXI TOUCH SCRIPT: loop %u done\n", loop);
+	}
+	printf("FUXI TOUCH SCRIPT: done\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
+ * fuxitour=S: S seconds after the key thread starts, walk a fixed tour of
+ * screens for screenshots: lock screen, home, Today view, Spotlight, Control
+ * Center, Settings (General, About), Clock, Calendar and Photos. Each screen
+ * prints "FUXI TOUR: shot N name" and holds for fuxitourhold=H seconds
+ * (default 45) so the USB monitor can read the framebuffer. Tap targets match
+ * the stock iOS 16 home layout at 1080x2400; fuxitourg=Y and fuxitoura=Y move
+ * the General and About rows in Settings. Device tests only (synthetic touch).
+ */
+static unsigned fk_tour_hold = 45, fk_tour_general = 2100, fk_tour_about = 400;
+
+static void
+fk_tap(int x, int y)
+{
+	fuxi_perf_input();
+	sweet_hid_touch(0, 1, x, y);
+	fk_script_sleep(80);
+	sweet_hid_touch(0, 0, x, y);
+}
+
+static void
+fk_tour_shot(unsigned *shot, const char *name)
+{
+	printf("FUXI TOUR: shot %u %s\n", ++*shot, name);
+	fk_script_sleep(fk_tour_hold * 1000u);
+}
+
+static void
+fk_tour_home(void)
+{
+	fk_swipe(540, 2390, 540, 1100, 250);
+	fk_script_sleep(2000);
+}
+
+static void
+fk_tour_app(unsigned *shot, int x, int y, const char *name)
+{
+	fk_tap(x, y);
+	fk_script_sleep(4000);
+	fk_tour_shot(shot, name);
+}
+
+static void
+fk_tour(void *arg, wait_result_t wr)
+{
+	(void)wr;
+	unsigned shot = 0;
+	printf("FUXI TOUR: starts in %u s, hold %u s\n", (unsigned)(uintptr_t)arg, fk_tour_hold);
+	fk_script_sleep((unsigned)(uintptr_t)arg * 1000u);
+	if (__atomic_load_n(&sweet_fb_display_off, __ATOMIC_RELAXED)) {
+		struct fuxi_key_inject cmd = {0, FUXI_KEY_INJECT_CLICK, 120};
+		(void)fk_inject(&cmd);
+		fk_script_sleep(2000);
+	}
+	fk_tour_shot(&shot, "lock");
+	fk_tour_home();
+	fk_tour_shot(&shot, "home");
+	/* App Library is past the last home page; extra swipes there are ignored. */
+	for (unsigned i = 0; i < 4; ++i) {
+		fk_swipe(900, 1300, 180, 1300, 250);
+		fk_script_sleep(1200);
+	}
+	fk_tour_shot(&shot, "app-library");
+	fk_script_sleep(8000);
+	fk_tour_shot(&shot, "app-library-idle");
+	fk_script_sleep(20000);
+	fk_tour_shot(&shot, "app-library-idle-30s");
+	fk_tour_home();
+	fk_tour_home();
+	fk_swipe(60, 1300, 1020, 1300, 450);    /* Today view */
+	fk_script_sleep(2000);
+	fk_tour_shot(&shot, "today");
+	fk_tour_home();
+	fk_tour_home();
+	fk_swipe(540, 900, 540, 1600, 250);     /* Spotlight */
+	fk_script_sleep(2000);
+	fk_tour_shot(&shot, "spotlight");
+	fk_tour_home();
+	fk_swipe(1000, 10, 1000, 1100, 250);    /* Control Center */
+	fk_script_sleep(2000);
+	fk_tour_shot(&shot, "control-center");
+	/* A home gesture on another page only returns to page 1 the second time. */
+	fk_tour_home();
+	fk_tour_home();
+	/* Settings reopens its last page: tap Back twice to reach the top list. */
+	fk_tap(670, 1710);
+	fk_script_sleep(4000);
+	fk_tap(110, 180);
+	fk_script_sleep(1500);
+	fk_tap(110, 180);
+	fk_script_sleep(2000);
+	fk_tour_shot(&shot, "settings");
+	fk_tour_app(&shot, 540, (int)fk_tour_general, "general");
+	fk_tour_app(&shot, 540, (int)fk_tour_about, "about");
+	fk_tour_home();
+	fk_tour_app(&shot, 670, 1140, "clock");
+	fk_tour_home();
+	fk_tour_app(&shot, 410, 860, "calendar");
+	fk_tour_home();
+	fk_tour_app(&shot, 670, 860, "photos");
+	fk_tour_home();
+	printf("FUXI TOUR: done\n");
+	(void)thread_terminate(current_thread());
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/*
  * fuxiautolock=S (10..3600): iOS turns the display off ~30 s after boot but
  * never again after a Power wake (docs-lanes/backlight.md). Once the display
  * has gone off and on at least once, press Power when it has been on for S
@@ -494,6 +667,38 @@ fuxi_keys_init(void)
 			thread_deallocate(thread);
 		} else {
 			printf("FUXI KEYS: script thread_start failed\n");
+		}
+	}
+	unsigned tour = 0;
+	if (PE_parse_boot_argn("fuxitour", &tour, sizeof(tour)) && tour > 0 && tour < 3600) {
+		unsigned v;
+		if (PE_parse_boot_argn("fuxitourhold", &v, sizeof(v)) && v >= 5 && v <= 300) {
+			fk_tour_hold = v;
+		}
+		if (PE_parse_boot_argn("fuxitourg", &v, sizeof(v)) && v < 2400) {
+			fk_tour_general = v;
+		}
+		if (PE_parse_boot_argn("fuxitoura", &v, sizeof(v)) && v < 2400) {
+			fk_tour_about = v;
+		}
+		if (kernel_thread_start(fk_tour, (void *)(uintptr_t)tour, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI TOUR: thread_start failed\n");
+		}
+	}
+	unsigned touch_script = 0;
+	if (PE_parse_boot_argn("fuxitouchscript", &touch_script, sizeof(touch_script)) &&
+	    touch_script > 0 && touch_script < 3600) {
+		if (PE_parse_boot_argn("fuxitouchscriptn", &fk_touch_loops, sizeof(fk_touch_loops)) &&
+		    (fk_touch_loops == 0 || fk_touch_loops > 100)) {
+			fk_touch_loops = 10;
+		}
+		if (kernel_thread_start(fk_touch_script, (void *)(uintptr_t)touch_script, &thread) ==
+		    KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("FUXI TOUCH SCRIPT: thread_start failed\n");
 		}
 	}
 }

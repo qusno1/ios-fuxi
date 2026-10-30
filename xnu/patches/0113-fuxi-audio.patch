@@ -1,0 +1,738 @@
+--- /dev/null
++++ b/bsd/dev/fuxi_gpr.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Ported from UniXNU-sheng package/ShengGpr.h (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
++/* The audio DSP's packet router (GPR) on the GLINK channel "adsp_apps": every packet starts with a 24-byte header (version and header
++ * size in words, total size, destination and source domain, source and destination port, token, opcode) followed by the payload. This
++ * is the codec and the first exchange an audio client makes: asking the DSP's audio framework manager (APM) whether the framework is
++ * ready. No I/O and no waits: the owner sends the bytes, feeds back what arrives and runs the retry and answer timers. */
++#ifndef FUXI_GPR_H
++#define FUXI_GPR_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define FUXI_GPR_HEADER_BYTES 24u
++#define FUXI_GPR_VERSION 0u
++#define FUXI_GPR_DOMAIN_MODEM 1u
++#define FUXI_GPR_DOMAIN_ADSP 2u
++#define FUXI_GPR_DOMAIN_APPS 3u
++#define FUXI_GPR_PORT_APM 1u                       /* the APM module instance, and the port its client uses */
++#define FUXI_GPR_OP_BASIC_RESULT 0x02001005u      /* payload {opcode, status} */
++#define FUXI_GPR_OP_APM_GET_SPF_STATE 0x01001021u
++#define FUXI_GPR_OP_APM_SPF_STATE 0x02001007u     /* payload {status}: 1 ready */
++#define FUXI_GPR_MAX_PACKET 512u
++
++typedef struct {
++    uint32_t version, header_bytes, size;
++    uint32_t dst_domain, src_domain, src_port, dst_port, token, opcode;
++    const uint8_t *payload;
++    uint32_t payload_bytes;
++} FuxiGprPacket;
++
++enum {FuxiGprOk = 0, FuxiGprShort = -1, FuxiGprBadVersion = -2, FuxiGprBadHeader = -3, FuxiGprBadSize = -4};
++
++/* Writes header and payload into out; returns the packet size, or 0 when it does not fit. */
++uint32_t fuxi_gpr_encode(uint8_t *out, uint32_t capacity, const FuxiGprPacket *p, const void *payload, uint32_t payload_bytes);
++/* Parses a received packet (length: the bytes received; the packet may be shorter). Returns FuxiGprOk or an error. */
++int fuxi_gpr_decode(const uint8_t *in, uint32_t length, FuxiGprPacket *p);
++/* A basic result's {opcode, status}; returns 0 when the packet is one. */
++int fuxi_gpr_basic_result(const FuxiGprPacket *p, uint32_t *opcode, uint32_t *status);
++
++/* Asking the APM whether the framework is ready: one query in flight; a "not ready" answer or a timeout lets the owner ask again after
++ * its retry pause, up to max_queries. */
++enum {FuxiSpfIdle, FuxiSpfWaiting, FuxiSpfReady, FuxiSpfGaveUp};
++enum {FuxiSpfIgnored = 0, FuxiSpfNotReady = 1, FuxiSpfIsReady = 2, FuxiSpfError = 3, FuxiSpfDone = 4};
++typedef struct {
++    uint32_t port, token, state, queries, max_queries;
++    uint32_t answers, errors, timeouts, ignored, last_status, last_opcode;
++} FuxiGprSpfProbe;
++
++void fuxi_gpr_spf_init(FuxiGprSpfProbe *s, uint32_t port, uint32_t max_queries);
++/* The query to send now, or 0 (one in flight, ready, or out of tries). */
++uint32_t fuxi_gpr_spf_next(FuxiGprSpfProbe *s, uint8_t out[FUXI_GPR_HEADER_BYTES]);
++/* A packet from the channel; returns one of the Spf* results. FuxiSpfError: the APM refused the query (status in last_status). */
++int fuxi_gpr_spf_receive(FuxiGprSpfProbe *s, const uint8_t *data, uint32_t length);
++/* The owner's answer timer ran out. Returns FuxiSpfDone when out of tries, else FuxiSpfIgnored. */
++int fuxi_gpr_spf_timeout(FuxiGprSpfProbe *s);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/fuxi_gpr.c
+@@ -0,0 +1,108 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Ported from UniXNU-sheng package/ShengGpr.c (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
++#include "fuxi_gpr.h"
++
++static void put32(uint8_t *p, uint32_t v) {p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
++
++uint32_t fuxi_gpr_encode(uint8_t *out, uint32_t capacity, const FuxiGprPacket *p, const void *payload, uint32_t payload_bytes)
++{
++    if (payload_bytes > FUXI_GPR_MAX_PACKET - FUXI_GPR_HEADER_BYTES || (payload_bytes && !payload)) return 0;
++    const uint32_t size = FUXI_GPR_HEADER_BYTES + payload_bytes;
++    if (size > capacity) return 0;
++    /* word 0: version 3:0, header size in words 7:4, packet size in bytes 31:8; word 1: destination domain 7:0, source domain 15:8 */
++    put32(out, (FUXI_GPR_VERSION & 0xfu) | (FUXI_GPR_HEADER_BYTES / 4) << 4 | size << 8);
++    put32(out + 4, (p->dst_domain & 0xffu) | (p->src_domain & 0xffu) << 8);
++    put32(out + 8, p->src_port);
++    put32(out + 12, p->dst_port);
++    put32(out + 16, p->token);
++    put32(out + 20, p->opcode);
++    for (uint32_t i = 0; i < payload_bytes; ++i) out[FUXI_GPR_HEADER_BYTES + i] = ((const uint8_t *)payload)[i];
++    return size;
++}
++
++int fuxi_gpr_decode(const uint8_t *in, uint32_t length, FuxiGprPacket *p)
++{
++    if (length < FUXI_GPR_HEADER_BYTES) return FuxiGprShort;
++    const uint32_t w0 = le32(in), w1 = le32(in + 4);
++    p->version = w0 & 0xfu;
++    p->header_bytes = ((w0 >> 4) & 0xfu) * 4;
++    p->size = w0 >> 8;
++    if (p->version != FUXI_GPR_VERSION) return FuxiGprBadVersion;
++    if (p->header_bytes < FUXI_GPR_HEADER_BYTES) return FuxiGprBadHeader;
++    if (p->size < p->header_bytes || p->size > length) return FuxiGprBadSize;
++    p->dst_domain = w1 & 0xffu;
++    p->src_domain = (w1 >> 8) & 0xffu;
++    p->src_port = le32(in + 8);
++    p->dst_port = le32(in + 12);
++    p->token = le32(in + 16);
++    p->opcode = le32(in + 20);
++    p->payload = in + p->header_bytes;
++    p->payload_bytes = p->size - p->header_bytes;
++    return FuxiGprOk;
++}
++
++int fuxi_gpr_basic_result(const FuxiGprPacket *p, uint32_t *opcode, uint32_t *status)
++{
++    if (p->opcode != FUXI_GPR_OP_BASIC_RESULT || p->payload_bytes < 8) return -1;
++    *opcode = le32(p->payload);
++    *status = le32(p->payload + 4);
++    return 0;
++}
++
++void fuxi_gpr_spf_init(FuxiGprSpfProbe *s, uint32_t port, uint32_t max_queries)
++{
++    for (unsigned i = 0; i < sizeof *s; ++i) ((uint8_t *)s)[i] = 0;
++    s->port = port;
++    s->max_queries = max_queries;
++    s->state = FuxiSpfIdle;
++}
++
++uint32_t fuxi_gpr_spf_next(FuxiGprSpfProbe *s, uint8_t out[FUXI_GPR_HEADER_BYTES])
++{
++    if (s->state != FuxiSpfIdle || s->queries >= s->max_queries) return 0;
++    const FuxiGprPacket p = {.dst_domain = FUXI_GPR_DOMAIN_ADSP, .src_domain = FUXI_GPR_DOMAIN_APPS, .src_port = s->port, .dst_port = FUXI_GPR_PORT_APM,
++                         .token = ++s->token, .opcode = FUXI_GPR_OP_APM_GET_SPF_STATE};
++    s->queries++;
++    s->state = FuxiSpfWaiting;
++    return fuxi_gpr_encode(out, FUXI_GPR_HEADER_BYTES, &p, 0, 0);
++}
++
++static int retry_or_stop(FuxiGprSpfProbe *s)
++{
++    if (s->queries >= s->max_queries) {s->state = FuxiSpfGaveUp; return FuxiSpfDone;}
++    s->state = FuxiSpfIdle;
++    return FuxiSpfNotReady;
++}
++
++int fuxi_gpr_spf_receive(FuxiGprSpfProbe *s, const uint8_t *data, uint32_t length)
++{
++    FuxiGprPacket p;
++    if (fuxi_gpr_decode(data, length, &p) != FuxiGprOk || p.dst_port != s->port || p.src_domain != FUXI_GPR_DOMAIN_ADSP) {s->ignored++; return FuxiSpfIgnored;}
++    s->last_opcode = p.opcode;
++    if (s->state != FuxiSpfWaiting || p.token != s->token) {s->ignored++; return FuxiSpfIgnored;}
++    uint32_t opcode = 0, status = 0;
++    if (p.opcode == FUXI_GPR_OP_APM_SPF_STATE && p.payload_bytes >= 4) {
++        s->answers++;
++        s->last_status = le32(p.payload);
++        if (s->last_status == 1) {s->state = FuxiSpfReady; return FuxiSpfIsReady;}
++        const int r = retry_or_stop(s);
++        return r;
++    }
++    if (!fuxi_gpr_basic_result(&p, &opcode, &status) && opcode == FUXI_GPR_OP_APM_GET_SPF_STATE) {
++        s->errors++;
++        s->last_status = status;
++        retry_or_stop(s);
++        return FuxiSpfError;
++    }
++    s->ignored++;
++    return FuxiSpfIgnored;
++}
++
++int fuxi_gpr_spf_timeout(FuxiGprSpfProbe *s)
++{
++    if (s->state != FuxiSpfWaiting) return FuxiSpfIgnored;
++    s->timeouts++;
++    return retry_or_stop(s) == FuxiSpfDone ? FuxiSpfDone : FuxiSpfIgnored;
++}
+--- /dev/null
++++ b/bsd/dev/fuxi_audioreach.h
+@@ -0,0 +1,112 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Ported from UniXNU-sheng package/ShengAudioReach.h (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
++/* The audio DSP's graph manager (APM) commands for a speaker and a microphone path, as GPR packets. Two graphs per direction:
++ * a device graph that owns the hardware endpoint and a stream graph that owns the shared memory endpoint; the stream graph's open
++ * carries the connection into the device graph. Instance numbers below are the SHENG board topology, NOT verified for fuxi: fuxi's speaker is a TDM secondary endpoint, so
++ * ar_open/config_speaker_device must be replaced once the fuxi ADSP topology is read from its ACDB (docs-lanes/audio.md). (device subgraph 0x4005 for the secondary
++ * MI2S speakers, 0x4007 for codec DMA TX3, stream subgraphs 0x4001 playback and 0x4003 capture). Each packet stays within one GLINK
++ * intent (FUXI_GPR_MAX_PACKET). Pure encoding: no I/O, no waits. */
++#ifndef FUXI_AUDIOREACH_H
++#define FUXI_AUDIOREACH_H
++#include <stdint.h>
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define FUXI_AR_APM_IID 1u
++#define FUXI_AR_OP_GRAPH_OPEN 0x01001000u
++#define FUXI_AR_OP_GRAPH_PREPARE 0x01001001u
++#define FUXI_AR_OP_GRAPH_START 0x01001002u
++#define FUXI_AR_OP_GRAPH_STOP 0x01001003u
++#define FUXI_AR_OP_GRAPH_CLOSE 0x01001004u
++#define FUXI_AR_OP_SET_CFG 0x01001006u
++#define FUXI_AR_OP_MEM_MAP 0x0100100Cu
++#define FUXI_AR_OP_MEM_UNMAP 0x0100100Du
++#define FUXI_AR_OP_MEM_MAP_DONE 0x02001001u          /* payload {handle} */
++#define FUXI_AR_OP_WRITE 0x0400100Au                 /* DATA_CMD_WR_SH_MEM_EP_DATA_BUFFER_V2 */
++#define FUXI_AR_OP_WRITE_DONE 0x05001004u
++#define FUXI_AR_OP_READ 0x0400100Bu                  /* DATA_CMD_RD_SH_MEM_EP_DATA_BUFFER_V2 */
++#define FUXI_AR_OP_READ_DONE 0x05001005u
++#define FUXI_AR_OP_EOS_RENDERED 0x05001001u
++
++/* Module ids and the instance ids the board topology gives them. */
++#define FUXI_AR_MOD_WR_SHMEM 0x07001000u
++#define FUXI_AR_MOD_RD_SHMEM 0x07001001u
++#define FUXI_AR_MOD_PCM_CNV 0x07001003u
++#define FUXI_AR_MOD_PCM_ENC 0x07001004u
++#define FUXI_AR_MOD_PCM_DEC 0x07001005u
++#define FUXI_AR_MOD_I2S_SINK 0x0700100Au
++#define FUXI_AR_MOD_CODEC_DMA_SOURCE 0x07001024u
++
++#define FUXI_AR_SG_PLAY 0x4001u
++#define FUXI_AR_SG_SPEAKER 0x4005u
++#define FUXI_AR_SG_CAPTURE 0x4003u
++#define FUXI_AR_SG_MIC 0x4007u
++#define FUXI_AR_IID_PLAY_SHMEM 0x6001u
++#define FUXI_AR_IID_PLAY_DEC 0x6002u
++#define FUXI_AR_IID_PLAY_CNV 0x6003u
++#define FUXI_AR_IID_SPEAKER_I2S 0x6051u
++#define FUXI_AR_IID_MIC_DMA 0x6070u
++#define FUXI_AR_IID_CAP_CNV 0x6022u
++#define FUXI_AR_IID_CAP_ENC 0x6023u
++#define FUXI_AR_IID_CAP_SHMEM 0x6024u
++
++typedef struct {
++    uint32_t rate;           /* Hz */
++    uint16_t bits;           /* 16 */
++    uint16_t channels;       /* 1 or 2 */
++} FuxiArFormat;
++
++/* Each builder writes one complete GPR packet into out (capacity bytes) and returns its size, or 0 when it does not fit.
++ * port: the GPR port the answers come back to; token: echoed in the answer. */
++uint32_t fuxi_ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
++uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
++uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
++uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
++uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
++uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
++/* channel_mask: codec DMA channels in use (bit 0 first channel). */
++uint32_t fuxi_ar_config_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, uint32_t channel_mask);
++uint32_t fuxi_ar_open_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token);
++uint32_t fuxi_ar_config_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f);
++/* opcode: FUXI_AR_OP_GRAPH_PREPARE, _START, _STOP or _CLOSE for the one subgraph sg. */
++uint32_t fuxi_ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, uint32_t sg);
++/* Maps one physically contiguous region (rounded up to 4 KiB) for the DSP; the answer is FUXI_AR_OP_MEM_MAP_DONE with the handle. */
++uint32_t fuxi_ar_map(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t bytes);
++uint32_t fuxi_ar_unmap(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t handle);
++/* One buffer for the playback shared memory endpoint; the answer is FUXI_AR_OP_WRITE_DONE with the same token. */
++uint32_t fuxi_ar_write(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes);
++/* One empty buffer for the capture shared memory endpoint; the answer is FUXI_AR_OP_READ_DONE. */
++uint32_t fuxi_ar_read(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes);
++
++/* The DSP's power and resource manager (PRM, port 2): an LPASS clock at hz (0 releases it; attribute "couple no", default root), and
++ * a hardware block vote (1 LPASS core macros, 2 digital codec). The answer is FUXI_AR_OP_PRM_REQUEST_DONE / _RELEASE_DONE. */
++#define FUXI_AR_PRM_IID 2u
++#define FUXI_AR_OP_PRM_REQUEST 0x0100100Fu
++#define FUXI_AR_OP_PRM_RELEASE 0x01001010u
++#define FUXI_AR_OP_PRM_REQUEST_DONE 0x02001002u
++#define FUXI_AR_OP_PRM_RELEASE_DONE 0x02001003u
++#define FUXI_AR_CLK_TX_CORE_MCLK 0x30cu   /* PRM clock ids, not the device tree indices (57 was refused) */
++#define FUXI_AR_CLK_VA_CORE_MCLK 0x307u
++#define FUXI_AR_HW_MACRO 1u
++#define FUXI_AR_HW_DCODEC 2u
++uint32_t fuxi_ar_prm_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t clock_id, uint32_t hz);
++uint32_t fuxi_ar_prm_clock_attr(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t clock_id, uint32_t hz, uint32_t attribute);
++uint32_t fuxi_ar_prm_vote(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t block, int enable);
++
++/* Answers. */
++typedef struct {
++    uint32_t opcode, token, src_port;
++    uint32_t result_opcode, status;  /* basic result: the command and its status (0 success); framework state: 1 ready; PRM: status */
++    uint32_t handle;                 /* FUXI_AR_OP_MEM_MAP_DONE */
++    uint64_t address;                /* write/read done: the buffer */
++    uint32_t data_bytes, offset;     /* read done: bytes filled, starting offset bytes into the buffer */
++} FuxiArAnswer;
++enum {FuxiArUnknown = 0, FuxiArBasicResult = 1, FuxiArMapped = 2, FuxiArWriteDone = 3, FuxiArReadDone = 4, FuxiArFrameworkState = 5, FuxiArPrmDone = 6, FuxiArBad = -1};
++int fuxi_ar_parse(const uint8_t *in, uint32_t length, FuxiArAnswer *a);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+--- /dev/null
++++ b/bsd/dev/fuxi_audioreach.c
+@@ -0,0 +1,377 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Copyright (c) 2026, UniXNU contributors. All rights reserved.
++ * Ported from UniXNU-sheng package/ShengAudioReach.c (08cde20edc32, BSD-2-Clause-Patent) with fuxi_ names. */
++#include "fuxi_audioreach.h"
++#include "fuxi_gpr.h"
++
++#define PARAM_HEADER 16u
++#define CMD_HEADER 16u
++#define PARAM_SG_CONFIG 0x08001001u
++#define PARAM_CONTAINER_CONFIG 0x08001000u
++#define PARAM_MODULE_LIST 0x08001002u
++#define PARAM_MODULE_PROP 0x08001003u
++#define PARAM_MODULE_CONN 0x08001004u
++#define PARAM_SG_LIST 0x08001005u
++#define PROP_SG_PERF 0x0800100Eu
++#define PROP_SG_DIRECTION 0x0800100Fu
++#define PROP_SG_SCENARIO 0x08001010u
++#define PROP_CONT_CAPS 0x08001011u
++#define PROP_CONT_POS 0x08001012u
++#define PROP_CONT_STACK 0x08001013u
++#define PROP_CONT_DOMAIN 0x08001014u
++#define PROP_PORT_INFO 0x08001015u
++#define PARAM_I2S_INTF 0x08001019u
++#define PARAM_HW_EP_MF 0x08001017u
++#define PARAM_FRAME_SIZE_FACTOR 0x08001018u
++#define PARAM_PCM_OUTPUT 0x08001008u
++#define PARAM_MEDIA_FORMAT 0x0800100Cu
++#define PARAM_CODEC_DMA_INTF 0x08001063u
++#define PARAM_HW_EP_POWER_MODE 0x08001176u
++#define CONTAINER_GC 0x0B001001u
++#define MEDIA_PCM 0x09001000u
++#define PERF_LOW_LATENCY 2u
++#define DIR_TX 1u
++#define DIR_RX 2u
++#define SCENARIO_PLAYBACK 1u
++#define SCENARIO_RECORD 2u
++#define POS_STREAM 1u
++#define POS_GLOBAL_DEV 4u
++#define DOMAIN_ADSP 2u
++#define STACK 8192u
++#define OUT_PORT 1u
++#define IN_PORT 2u
++#define LPAIF 0u
++#define LPAIF_RXTX 1u
++#define I2S_SECONDARY 1u
++#define I2S_SD1 2u
++#define WS_INTERNAL 1u
++#define CODEC_TX3 4u
++#define INTERLEAVED 1u
++#define DEINTERLEAVED_UNPACKED 3u
++
++typedef struct {uint8_t *p; uint32_t n, cap; int bad;} W;
++
++static void put8(W *w, uint32_t v) {if (w->n + 1 > w->cap) {w->bad = 1; return;} w->p[w->n++] = (uint8_t)v;}
++static void put16(W *w, uint32_t v) {put8(w, v); put8(w, v >> 8);}
++static void put32(W *w, uint32_t v) {put16(w, v); put16(w, v >> 16);}
++static void pad_to(W *w, uint32_t end) {while (!w->bad && w->n < end) put8(w, 0);}
++static uint32_t align8(uint32_t v) {return (v + 7u) & ~7u;}
++static uint32_t le32(const uint8_t *p) {return (uint32_t)p[0] | (uint32_t)p[1] << 8 | (uint32_t)p[2] << 16 | (uint32_t)p[3] << 24;}
++static void set32(W *w, uint32_t at, uint32_t v) {if (at + 4 <= w->n) {w->p[at] = (uint8_t)v; w->p[at + 1] = (uint8_t)(v >> 8); w->p[at + 2] = (uint8_t)(v >> 16); w->p[at + 3] = (uint8_t)(v >> 24);}}
++
++/* GPR header with the packet size patched in at the end (finish). */
++static void begin(W *w, uint8_t *out, uint32_t capacity, uint32_t port, uint32_t dst, uint32_t token, uint32_t opcode)
++{
++    w->p = out; w->n = 0; w->cap = capacity < FUXI_GPR_MAX_PACKET ? capacity : FUXI_GPR_MAX_PACKET; w->bad = 0;
++    put32(w, 0); put32(w, FUXI_GPR_DOMAIN_ADSP | FUXI_GPR_DOMAIN_APPS << 8); put32(w, port); put32(w, dst); put32(w, token); put32(w, opcode);
++}
++static uint32_t finish(W *w)
++{
++    if (w->bad) return 0;
++    set32(w, 0, (FUXI_GPR_VERSION & 0xfu) | (FUXI_GPR_HEADER_BYTES / 4) << 4 | w->n << 8);
++    return w->n;
++}
++/* The APM command header: in-band payload of the given size follows. */
++static void cmd_header(W *w, uint32_t payload) {put32(w, 0); put32(w, 0); put32(w, 0); put32(w, payload);}
++static uint32_t cmd_payload_start(W *w) {uint32_t at = w->n; cmd_header(w, 0); return at;}
++static void cmd_payload_end(W *w, uint32_t at) {set32(w, at + 12, w->n - at - CMD_HEADER);}
++/* One parameter block: header, body written by the caller, then padding to 8 bytes; param_size counts body and padding. */
++static uint32_t param_begin(W *w, uint32_t iid, uint32_t id) {uint32_t at = w->n; put32(w, iid); put32(w, id); put32(w, 0); put32(w, 0); return at;}
++static void param_end(W *w, uint32_t at) {pad_to(w, at + align8(w->n - at)); set32(w, at + 8, w->n - at - PARAM_HEADER);}
++
++typedef struct {uint32_t id, perf, direction, scenario;} Sg;
++typedef struct {uint32_t id, position;} Container;
++typedef struct {uint32_t module, iid, inputs, outputs;} Module;
++typedef struct {uint32_t from, to;} Link;
++
++/* One subgraph with one container (all the board topology uses). */
++static uint32_t graph_open(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const Sg *sg, const Container *c,
++                           const Module *m, unsigned modules, const Link *l, unsigned links)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_GRAPH_OPEN);
++    const uint32_t cmd = cmd_payload_start(&w);
++    uint32_t at = param_begin(&w, FUXI_AR_APM_IID, PARAM_SG_CONFIG);
++    put32(&w, 1);
++    put32(&w, sg->id); put32(&w, 3);
++    put32(&w, PROP_SG_PERF); put32(&w, 4); put32(&w, sg->perf);
++    put32(&w, PROP_SG_DIRECTION); put32(&w, 4); put32(&w, sg->direction);
++    put32(&w, PROP_SG_SCENARIO); put32(&w, 4); put32(&w, sg->scenario);
++    param_end(&w, at);
++    at = param_begin(&w, FUXI_AR_APM_IID, PARAM_CONTAINER_CONFIG);
++    put32(&w, 1);
++    put32(&w, c->id); put32(&w, 4);
++    put32(&w, PROP_CONT_CAPS); put32(&w, 8); put32(&w, 1); put32(&w, CONTAINER_GC);
++    put32(&w, PROP_CONT_POS); put32(&w, 4); put32(&w, c->position);
++    put32(&w, PROP_CONT_STACK); put32(&w, 4); put32(&w, STACK);
++    put32(&w, PROP_CONT_DOMAIN); put32(&w, 4); put32(&w, DOMAIN_ADSP);
++    param_end(&w, at);
++    at = param_begin(&w, FUXI_AR_APM_IID, PARAM_MODULE_LIST);
++    put32(&w, 1);
++    put32(&w, sg->id); put32(&w, c->id); put32(&w, modules);
++    for (unsigned i = 0; i < modules; ++i) {put32(&w, m[i].module); put32(&w, m[i].iid);}
++    param_end(&w, at);
++    at = param_begin(&w, FUXI_AR_APM_IID, PARAM_MODULE_PROP);
++    put32(&w, modules);
++    for (unsigned i = 0; i < modules; ++i) {
++        put32(&w, m[i].iid); put32(&w, 1); put32(&w, PROP_PORT_INFO); put32(&w, 8); put32(&w, m[i].inputs); put32(&w, m[i].outputs);
++    }
++    param_end(&w, at);
++    at = param_begin(&w, FUXI_AR_APM_IID, PARAM_MODULE_CONN);
++    put32(&w, links);
++    for (unsigned i = 0; i < links; ++i) {put32(&w, l[i].from); put32(&w, OUT_PORT); put32(&w, l[i].to); put32(&w, IN_PORT);}
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_open_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_SPEAKER, PERF_LOW_LATENCY, DIR_TX, SCENARIO_PLAYBACK};
++    static const Container c = {FUXI_AR_SG_SPEAKER, POS_STREAM};
++    static const Module m[] = {{FUXI_AR_MOD_I2S_SINK, FUXI_AR_IID_SPEAKER_I2S, 1, 0}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
++}
++
++uint32_t fuxi_ar_open_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_PLAY, PERF_LOW_LATENCY, DIR_RX, SCENARIO_PLAYBACK};
++    static const Container c = {FUXI_AR_SG_PLAY, POS_STREAM};
++    static const Module m[] = {{FUXI_AR_MOD_WR_SHMEM, FUXI_AR_IID_PLAY_SHMEM, 0, 1}, {FUXI_AR_MOD_PCM_DEC, FUXI_AR_IID_PLAY_DEC, 1, 1},
++                               {FUXI_AR_MOD_PCM_CNV, FUXI_AR_IID_PLAY_CNV, 1, 1}};
++    static const Link l[] = {{FUXI_AR_IID_PLAY_SHMEM, FUXI_AR_IID_PLAY_DEC}, {FUXI_AR_IID_PLAY_DEC, FUXI_AR_IID_PLAY_CNV}, {FUXI_AR_IID_PLAY_CNV, FUXI_AR_IID_SPEAKER_I2S}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
++}
++
++uint32_t fuxi_ar_open_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_MIC, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
++    static const Container c = {FUXI_AR_SG_MIC, POS_GLOBAL_DEV};
++    static const Module m[] = {{FUXI_AR_MOD_CODEC_DMA_SOURCE, FUXI_AR_IID_MIC_DMA, 0, 1}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 1, 0, 0);
++}
++
++uint32_t fuxi_ar_open_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token)
++{
++    static const Sg sg = {FUXI_AR_SG_CAPTURE, PERF_LOW_LATENCY, DIR_TX, SCENARIO_RECORD};
++    static const Container c = {FUXI_AR_SG_CAPTURE, POS_GLOBAL_DEV};
++    static const Module m[] = {{FUXI_AR_MOD_PCM_CNV, FUXI_AR_IID_CAP_CNV, 1, 1}, {FUXI_AR_MOD_PCM_ENC, FUXI_AR_IID_CAP_ENC, 1, 1},
++                               {FUXI_AR_MOD_RD_SHMEM, FUXI_AR_IID_CAP_SHMEM, 1, 0}};
++    static const Link l[] = {{FUXI_AR_IID_MIC_DMA, FUXI_AR_IID_CAP_CNV}, {FUXI_AR_IID_CAP_CNV, FUXI_AR_IID_CAP_ENC}, {FUXI_AR_IID_CAP_ENC, FUXI_AR_IID_CAP_SHMEM}};
++    return graph_open(out, capacity, port, token, &sg, &c, m, 3, l, 3);
++}
++
++static void hw_ep_mf(W *w, uint32_t iid, const FuxiArFormat *f)
++{
++    const uint32_t at = param_begin(w, iid, PARAM_HW_EP_MF);
++    put32(w, f->rate); put16(w, f->bits); put16(w, f->channels); put32(w, 1);
++    param_end(w, at);
++}
++static void frame_size_factor(W *w, uint32_t iid)
++{
++    const uint32_t at = param_begin(w, iid, PARAM_FRAME_SIZE_FACTOR);
++    put32(w, 1);
++    param_end(w, at);
++}
++static void channel_map(W *w, unsigned channels) {for (unsigned i = 0; i < channels; ++i) put8(w, i + 1);}   /* FL = 1, FR = 2 */
++
++uint32_t fuxi_ar_config_speaker_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, FUXI_AR_IID_SPEAKER_I2S, PARAM_I2S_INTF);
++    put32(&w, LPAIF); put32(&w, I2S_SECONDARY); put16(&w, I2S_SD1); put16(&w, WS_INTERNAL);
++    param_end(&w, at);
++    hw_ep_mf(&w, FUXI_AR_IID_SPEAKER_I2S, f);
++    frame_size_factor(&w, FUXI_AR_IID_SPEAKER_I2S);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_config_mic_device(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f, uint32_t channel_mask)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    hw_ep_mf(&w, FUXI_AR_IID_MIC_DMA, f);
++    frame_size_factor(&w, FUXI_AR_IID_MIC_DMA);
++    uint32_t at = param_begin(&w, FUXI_AR_IID_MIC_DMA, PARAM_CODEC_DMA_INTF);
++    put32(&w, LPAIF_RXTX); put32(&w, CODEC_TX3); put32(&w, channel_mask);
++    param_end(&w, at);
++    at = param_begin(&w, FUXI_AR_IID_MIC_DMA, PARAM_HW_EP_POWER_MODE);
++    put32(&w, 0);
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++/* PCM output format of a decoder, converter or encoder. */
++static void pcm_output(W *w, uint32_t iid, const FuxiArFormat *f, uint32_t interleaving)
++{
++    const uint32_t at = param_begin(w, iid, PARAM_PCM_OUTPUT);
++    put32(w, 1); put32(w, MEDIA_PCM); put32(w, (16u + f->channels + 3u) & ~3u);
++    put16(w, f->bits); put16(w, 1); put16(w, f->bits); put16(w, f->bits - 1u); put16(w, 1); put16(w, interleaving); put16(w, 0);
++    put16(w, f->channels);
++    channel_map(w, f->channels);
++    param_end(w, at);
++}
++
++uint32_t fuxi_ar_config_playback_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    pcm_output(&w, FUXI_AR_IID_PLAY_DEC, f, INTERLEAVED);
++    pcm_output(&w, FUXI_AR_IID_PLAY_CNV, f, DEINTERLEAVED_UNPACKED);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_config_capture_stream(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    pcm_output(&w, FUXI_AR_IID_CAP_CNV, f, INTERLEAVED);
++    pcm_output(&w, FUXI_AR_IID_CAP_ENC, f, INTERLEAVED);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++/* The input media format of the playback shared memory endpoint, sent to the endpoint itself. */
++uint32_t fuxi_ar_config_playback_shmem(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, const FuxiArFormat *f)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_IID_PLAY_SHMEM, token, FUXI_AR_OP_SET_CFG);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, FUXI_AR_IID_PLAY_SHMEM, PARAM_MEDIA_FORMAT);
++    const uint32_t body = align8(12u + 16u + f->channels);
++    put32(&w, 1); put32(&w, MEDIA_PCM); put32(&w, body + PARAM_HEADER - 12u);
++    put32(&w, f->rate); put16(&w, f->bits); put16(&w, 1); put16(&w, f->bits); put16(&w, f->bits - 1u); put16(&w, 1);
++    put16(&w, f->channels);
++    channel_map(&w, f->channels);
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_graph_command(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t opcode, uint32_t sg)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, opcode);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, FUXI_AR_APM_IID, PARAM_SG_LIST);
++    put32(&w, 1); put32(&w, sg);
++    param_end(&w, at);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++/* As the DSP's own client builds it: the region follows the GPR header directly; the command header space trails the packet. */
++uint32_t fuxi_ar_map(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t bytes)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_MEM_MAP);
++    put16(&w, 3); put16(&w, 1); put32(&w, 0);                      /* shared 8-byte-aligned 4 KiB pool, one region, no flags */
++    put32(&w, (uint32_t)address); put32(&w, (uint32_t)(address >> 32)); put32(&w, (bytes + 4095u) & ~4095u);
++    pad_to(&w, w.n + CMD_HEADER);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_unmap(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t handle)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_APM_IID, token, FUXI_AR_OP_MEM_UNMAP);
++    put32(&w, handle);
++    pad_to(&w, w.n + CMD_HEADER);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_write(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_IID_PLAY_SHMEM, token, FUXI_AR_OP_WRITE);
++    put32(&w, (uint32_t)address); put32(&w, (uint32_t)(address >> 32)); put32(&w, handle); put32(&w, bytes);
++    put32(&w, 0); put32(&w, 0); put32(&w, 0);                      /* no time stamp, no flags */
++    put32(&w, 0); put32(&w, 0); put32(&w, 0); put32(&w, 0);         /* no metadata */
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_read(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint64_t address, uint32_t handle, uint32_t bytes)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_IID_CAP_SHMEM, token, FUXI_AR_OP_READ);
++    put32(&w, (uint32_t)address); put32(&w, (uint32_t)(address >> 32)); put32(&w, handle); put32(&w, bytes);
++    put32(&w, 0); put32(&w, 0); put32(&w, 0); put32(&w, 0);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_prm_clock(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t clock_id, uint32_t hz)
++{
++    return fuxi_ar_prm_clock_attr(out, capacity, port, token, clock_id, hz, 1);
++}
++
++uint32_t fuxi_ar_prm_clock_attr(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t clock_id, uint32_t hz, uint32_t attribute)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_PRM_IID, token, hz ? FUXI_AR_OP_PRM_REQUEST : FUXI_AR_OP_PRM_RELEASE);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, FUXI_AR_PRM_IID, 0x0800102Cu);    /* audio hardware clock */
++    put32(&w, 1); put32(&w, clock_id);
++    if (hz) {put32(&w, hz); put32(&w, attribute); put32(&w, 0);}    /* frequency, attribute (1 "couple no"), default root */
++    set32(&w, at + 8, w.n - at - PARAM_HEADER);                      /* exact size: the reference client does not pad these */
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++uint32_t fuxi_ar_prm_vote(uint8_t *out, uint32_t capacity, uint32_t port, uint32_t token, uint32_t block, int enable)
++{
++    W w;
++    begin(&w, out, capacity, port, FUXI_AR_PRM_IID, token, enable ? FUXI_AR_OP_PRM_REQUEST : FUXI_AR_OP_PRM_RELEASE);
++    const uint32_t cmd = cmd_payload_start(&w);
++    const uint32_t at = param_begin(&w, FUXI_AR_PRM_IID, 0x08001032u);    /* hardware core */
++    put32(&w, block);
++    set32(&w, at + 8, w.n - at - PARAM_HEADER);
++    cmd_payload_end(&w, cmd);
++    return finish(&w);
++}
++
++int fuxi_ar_parse(const uint8_t *in, uint32_t length, FuxiArAnswer *a)
++{
++    FuxiGprPacket p;
++    for (unsigned i = 0; i < sizeof *a; ++i) ((uint8_t *)a)[i] = 0;
++    if (fuxi_gpr_decode(in, length, &p) != FuxiGprOk) return FuxiArBad;
++    a->opcode = p.opcode; a->token = p.token; a->src_port = p.src_port;
++    const uint8_t *d = p.payload;
++    switch (p.opcode) {
++    case FUXI_GPR_OP_BASIC_RESULT:
++        if (p.payload_bytes < 8) return FuxiArBad;
++        a->result_opcode = le32(d); a->status = le32(d + 4);
++        return FuxiArBasicResult;
++    case FUXI_AR_OP_PRM_REQUEST_DONE:
++    case FUXI_AR_OP_PRM_RELEASE_DONE:
++        if (p.payload_bytes < 4) return FuxiArBad;
++        a->status = le32(d + (p.payload_bytes >= 8 ? 4 : 0));
++        return FuxiArPrmDone;
++    case FUXI_GPR_OP_APM_SPF_STATE:
++        if (p.payload_bytes < 4) return FuxiArBad;
++        a->status = le32(d);
++        return FuxiArFrameworkState;
++    case FUXI_AR_OP_MEM_MAP_DONE:
++        if (p.payload_bytes < 4) return FuxiArBad;
++        a->handle = le32(d);
++        return FuxiArMapped;
++    case FUXI_AR_OP_WRITE_DONE:
++        if (p.payload_bytes < 16) return FuxiArBad;
++        a->address = le32(d) | (uint64_t)le32(d + 4) << 32; a->handle = le32(d + 8); a->status = le32(d + 12);
++        return FuxiArWriteDone;
++    case FUXI_AR_OP_READ_DONE:
++        if (p.payload_bytes < 20) return FuxiArBad;
++        a->status = le32(d); a->address = le32(d + 4) | (uint64_t)le32(d + 8) << 32; a->handle = le32(d + 12); a->data_bytes = le32(d + 16);
++        a->offset = p.payload_bytes >= 24 ? le32(d + 20) : 0;   /* RD_SH_MEM_EP_DATA_BUFFER_DONE_V2: status, address, handle, size, offset */
++        return FuxiArReadDone;
++    default:
++        return FuxiArUnknown;
++    }
++}
+--- /dev/null
++++ b/bsd/dev/fuxi_rpmh_arb.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: BSD-2-Clause-Patent */
++/* Serialises every user of the apps RSC (DRV2) ACTIVE TCS sequencer. One request is: program the TCS, trigger, wait for idle and
++ * per-command status, clean up. Two drivers doing that at once (the audio DSP's and the modem/WLAN drivers' votes) corrupt each other's
++ * cmd/enable/wait words, so the whole sequence runs under this one lock, the same cure as hackios's single RSC mutex (idea only, own
++ * code). A failed or uncertain sequence leaves the TCS state unknown: leave(ok=0) poisons the arbiter for the session, as the WLAN
++ * driver's rh_poisoned does. Freestanding: C11-style __atomic builtins, a bounded spin, no kernel lock or allocator. The caller owns the
++ * policy of what to do on FUXI_RPMH_BUSY (retry later; never from a context that may hold the lock). Not wired into fuxi_wlan.c yet:
++ * rh_send_request there still uses its unlocked rh_poisoned flag (docs-lanes/audio.md, P-AU1). */
++#ifndef FUXI_RPMH_ARB_H
++#define FUXI_RPMH_ARB_H
++#include <stdint.h>
++
++#define FUXI_RPMH_OWNER_WLAN 1u
++#define FUXI_RPMH_OWNER_AUDIO 2u
++#define FUXI_RPMH_OWNER_OTHER 3u
++enum {FUXI_RPMH_OK = 0, FUXI_RPMH_BUSY = 1, FUXI_RPMH_POISONED = 2, FUXI_RPMH_RECURSIVE = 3, FUXI_RPMH_BAD_OWNER = 4};
++
++typedef struct {
++    volatile uint32_t lock_owner;            /* 0 free, else the owner id holding the sequencer */
++    volatile uint32_t poisoned;
++    volatile uint32_t holds, contended, timeouts, poisons;   /* counters for the log line */
++} FuxiRpmhArb;
++
++#if defined(__aarch64__)
++#define FUXI_RPMH_RELAX() __asm__ volatile("yield" ::: "memory")
++#elif defined(__x86_64__) || defined(__i386__)
++#define FUXI_RPMH_RELAX() __asm__ volatile("pause" ::: "memory")
++#else
++#define FUXI_RPMH_RELAX() __asm__ volatile("" ::: "memory")
++#endif
++
++static inline void fuxi_rpmh_arb_init(FuxiRpmhArb *a)
++{
++    __atomic_store_n(&a->lock_owner, 0, __ATOMIC_RELAXED); __atomic_store_n(&a->poisoned, 0, __ATOMIC_RELAXED);
++    a->holds = a->contended = a->timeouts = a->poisons = 0;
++}
++
++/* Takes the sequencer for owner (nonzero) with at most spins attempts. FUXI_RPMH_OK: held, call leave. Anything else: not held. */
++static inline int fuxi_rpmh_arb_enter(FuxiRpmhArb *a, uint32_t owner, uint32_t spins)
++{
++    if (!owner) return FUXI_RPMH_BAD_OWNER;
++    if (__atomic_load_n(&a->lock_owner, __ATOMIC_RELAXED) == owner) return FUXI_RPMH_RECURSIVE;
++    int waited = 0;
++    for (uint32_t i = 0; ; ++i) {
++        uint32_t free = 0;
++        if (__atomic_compare_exchange_n(&a->lock_owner, &free, owner, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) break;
++        if (!waited) {waited = 1; __atomic_fetch_add(&a->contended, 1, __ATOMIC_RELAXED);}
++        if (i >= spins) {__atomic_fetch_add(&a->timeouts, 1, __ATOMIC_RELAXED); return FUXI_RPMH_BUSY;}
++        FUXI_RPMH_RELAX();
++    }
++    if (__atomic_load_n(&a->poisoned, __ATOMIC_RELAXED)) {__atomic_store_n(&a->lock_owner, 0, __ATOMIC_RELEASE); return FUXI_RPMH_POISONED;}
++    __atomic_fetch_add(&a->holds, 1, __ATOMIC_RELAXED);
++    return FUXI_RPMH_OK;
++}
++
++/* Ends a sequence. ok=0 means the TCS state is uncertain: later enters get FUXI_RPMH_POISONED. */
++static inline int fuxi_rpmh_arb_leave(FuxiRpmhArb *a, uint32_t owner, int ok)
++{
++    if (!owner || __atomic_load_n(&a->lock_owner, __ATOMIC_RELAXED) != owner) return FUXI_RPMH_BAD_OWNER;
++    if (!ok) {__atomic_store_n(&a->poisoned, 1, __ATOMIC_RELAXED); __atomic_fetch_add(&a->poisons, 1, __ATOMIC_RELAXED);}
++    __atomic_store_n(&a->lock_owner, 0, __ATOMIC_RELEASE);
++    return FUXI_RPMH_OK;
++}
++#endif

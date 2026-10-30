@@ -403,3 +403,14 @@ press with the waking touch withheld (ported into `fuxi_key_state.h`,
 consumer usage map used for the audit; `userland/src/inject_sb.c`: the false-Siri
 analysis (not ported, SpringBoard hook). HackiOS kernel `redwood_buttons.c`
 (APSL 2.0): press start time and held duration.
+
+### Scripted touch workload (`fuxitouchscript=S`)
+
+A fixed gesture loop for GPU/UI timing without anyone at the phone. S seconds
+after the key thread starts it runs `fuxitouchscriptn` loops (default 10). Each
+loop wakes the display with an injected Power click if it is off, swipes up from
+the bottom edge, swipes three home pages left and three right, opens Spotlight
+and goes home, then opens Control Center and goes home. That is about 16 s per
+loop. Touches use finger 0 and the normal `sweet_hid_touch` path, and they call
+`fuxi_perf_input()` like real contacts. They are synthetic: test boots only.
+The log marks `FUXI TOUCH SCRIPT: loop N start/done`.

@@ -4,6 +4,7 @@
 #include <cassert>
 #include <fstream>
 #include <iterator>
+#include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
 template<class F> static std::string refuses(F f){try{f();}catch(const std::runtime_error &e){return e.what();}assert(false);return {};}
@@ -14,6 +15,21 @@ static void transfers(fuxi::Backend &b){
  auto mismatch=b.linearAliasMismatch(req,layout,0,512,3,480);
  for(const char *part:{"alignment offset=3 required=64","memory type buffer=0 allowedBits=2","size required=1024 available=509","layout.offset Vulkan=8 Metal=0","rowPitch Vulkan=256 Metal=480"})assert(mismatch.find(part)!=std::string::npos);
  req.alignment=1;req.memoryTypeBits=1;req.size=512;layout.offset=0;layout.rowPitch=480;assert(b.linearAliasMismatch(req,layout,0,512,0,480).empty());
+ // An enclosing-page import binds at its pointer offset: the alignment test uses memory offset + texture offset.
+ req.alignment=64;assert(b.linearAliasMismatch(req,layout,0,1024,0,480,64).empty() && b.linearAliasMismatch(req,layout,0,1024,64,480,128).empty());
+ assert(b.linearAliasMismatch(req,layout,0,1024,0,480,8).find("alignment offset=8 required=64")!=std::string::npos);
+ assert(b.linearAliasMismatch(req,layout,0,1024,32,480,32).empty());
+ // No-copy import: null/empty refuse; with host import, aligned and enclosing-page pointers keep contents==caller pointer.
+ {auto attempts=fuxi::HostImportStats::attempts.load();
+  assert(!refuses([&]{b.importBuffer(nullptr,64);}).empty() && !refuses([&]{b.importBuffer((void *)0x10000,0);}).empty());
+  if(b.supportsHostImport()){
+   size_t pg=16384;void *m=mmap(nullptr,4*pg,PROT_READ|PROT_WRITE,MAP_ANON|MAP_PRIVATE,-1,0);assert(m!=MAP_FAILED);memset(m,0x5a,4*pg);
+   for(size_t off:{size_t(0),size_t(256),pg-64}){size_t len=off==pg-64?200:pg;
+    fuxi::Buffer *imported=nullptr;try{imported=b.importBuffer((uint8_t *)m+off,len);}catch(const std::runtime_error &e){assert(off!=0 && std::string(e.what()).find("no-copy buffer")!=std::string::npos);}
+    if(imported){assert(imported->contents==(uint8_t *)m+off && imported->length==len && *(uint8_t *)imported->contents==0x5a);b.destroy(imported);}}
+   munmap(m,4*pg);
+  }
+  assert(fuxi::HostImportStats::attempts.load()>=attempts+2);}
  for(uint32_t format:{1u,30u}){
   const size_t pixel=b.texelBytes(format),offset=3*pixel,row=16*pixel,w=7,h=5;
   // Only the used bytes of the last row exist. Odd binding offsets and padded
@@ -42,7 +58,7 @@ static void transfers(fuxi::Backend &b){
   assert(refuses([&]{b.linearTexture(buffer,format,1,w,h+1,offset,row);}).size());
   assert(b.resourceBytes()==charged);
   b.destroy(buffer);assert(t->backingBuffer->references==1);verify(); // texture owns backend backing too.
-  b.destroy(t);b.destroy(out);assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
+  b.destroy(t);b.destroy(out);b.trimMemory();assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
  }
  // Survey-sized buffers use tight final rows, including strides that differ
  // from lavapipe's image pitch. Compare every texel and preserve the buffer.
@@ -59,7 +75,7 @@ static void transfers(fuxi::Backend &b){
  // Exact alias still borrows its allocation and retains the backing buffer.
  auto *buffer=b.allocate(65536);auto *alias=b.linearTexture(buffer,80,1,16,8,0,64);
  assert(!alias->shadow && alias->borrowedMemory && !alias->charged);b.destroy(buffer);b.destroy(alias);
- assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
+ b.trimMemory();assert(b.resourceBytes()==baseline && fuxi::liveMemoryObjects==memory);
  // Force budget exhaustion only for the shadow, then prove rollback of the
  // attempted image and that the caller's existing buffer remains usable.
  auto *small=b.allocate(128);std::vector<fuxi::Buffer *> ballast;
@@ -120,7 +136,7 @@ int main(int argc,char **argv){
  assert(argc==1 || argc==2);
  if(argc==2){lines(b,argv[1]);puts("PASS: M9o actual bridge line/list/strip/index/restart pixels, odd/empty counts, lazy cache reuse and sampled shadow CPU coherence");}
  else puts("SKIP: M9o shader/line controls require --translator");
- assert(b.resourceBytes()==baseline);
+ b.trimMemory();assert(b.resourceBytes()==baseline);
  assert(fuxi::primitiveCount(fuxi::Topology::Line,598)==598 && fuxi::primitiveCount(fuxi::Topology::Line,599)==598);
  puts("PASS: M9o mismatch diagnostics, shadow rows/offset/tight bounds, CPU/GPU coherence, sentinels, ownership, budget/rollback and poison/requireLive");
 }

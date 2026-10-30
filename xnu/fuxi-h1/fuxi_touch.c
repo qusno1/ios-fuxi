@@ -27,6 +27,11 @@
  * they lift. Without a wake press nothing changes.
  * Ported from HackiOS hackios-xnu-userland userland/src/inject.c (MIT):
  * the waking touch is kept from iOS. MIT notice in fuxi_key_state.h.
+ *
+ * Report batching/counters: adapted from UniXNU/NativeHidInput,
+ * 75efe1c, e43c254, 22f2dd4 and ba03e5d (BSD-2-Clause-Patent).
+ * Notice: iokit/Kernel/arm/hid/LICENSE.NativeHidInput. fuxitbatch=1
+ * sends the complete ID-indexed contact set in one digitizer collection.
  */
 #if defined(FUXI)
 #include <sys/param.h>
@@ -45,6 +50,7 @@
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
+extern int sweet_hid_touch_report(uint32_t mask, const int *x, const int *y);
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
     void *parameter, integer_t priority, thread_t *new_thread);
@@ -74,12 +80,15 @@ static struct {
 	uint64_t dma_pa;
 	unsigned depth, level, wp[2], evrp;
 	bool started;
+	unsigned batch;              /* opt-in report-wide HID collection */
+	bool retry;                  /* latest set not yet constructed by HID */
 	uint32_t active;
 	int x[FT_MAX], y[FT_MAX];
 	bool ic_reset;                 /* controller-ready event while sensing */
 	/* Per-contact statistics (first finger down -> last finger up). */
 	uint64_t c_start, c_last, c_poll_sum, c_poll_max;
 	unsigned c_reports, c_polls, contacts;
+	unsigned c_multi, c_max, c_lifts;
 	struct fuxi_wake_touch wake;   /* tap-to-wake contact filter */
 } ft;
 static int ft_chan;
@@ -471,9 +480,11 @@ ft_contact_end(void)
 	uint64_t dur = ft_us(ft.c_last - ft.c_start);
 	ft.contacts++;
 	printf("FUXI TOUCH: contact %u: %u reports in %llu ms (%llu us apart), %u polls, "
-	    "FIFO read avg %llu us max %llu us\n", ft.contacts, ft.c_reports, dur / 1000,
+	    "FIFO read avg %llu us max %llu us, multi %u max %u lifts %u\n",
+	    ft.contacts, ft.c_reports, dur / 1000,
 	    ft.c_reports > 1 ? dur / (ft.c_reports - 1) : 0ULL, ft.c_polls,
-	    ft.c_polls ? ft_us(ft.c_poll_sum) / ft.c_polls : 0ULL, ft_us(ft.c_poll_max));
+	    ft.c_polls ? ft_us(ft.c_poll_sum) / ft.c_polls : 0ULL, ft_us(ft.c_poll_max),
+	    ft.c_multi, ft.c_max, ft.c_lifts);
 }
 
 extern void fuxi_perf_input(void);
@@ -486,15 +497,28 @@ ft_report(uint32_t mask)
 		ft.c_start = now;
 		ft.c_reports = ft.c_polls = 0;
 		ft.c_poll_sum = ft.c_poll_max = 0;
+		ft.c_multi = ft.c_max = ft.c_lifts = 0;
 	}
+	unsigned down_count = 0;
 	for (unsigned id = 0; id < FT_MAX; id++) {
 		uint32_t bit = 1u << id;
 		if (mask & bit) {
-			sweet_hid_touch((int)id, 1, ft.x[id], ft.y[id]);
+			down_count++;
+			if (!ft.batch) {
+				sweet_hid_touch((int)id, 1, ft.x[id], ft.y[id]);
+			}
 		} else if (ft.active & bit) {
-			sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
+			ft.c_lifts++;
+			if (!ft.batch) {
+				sweet_hid_touch((int)id, 0, ft.x[id], ft.y[id]);
+			}
 		}
 	}
+	if (ft.batch && (mask || ft.active)) {
+		ft.retry = !sweet_hid_touch_report(mask, ft.x, ft.y);
+	}
+	ft.c_multi += down_count >= 2;
+	ft.c_max = down_count > ft.c_max ? down_count : ft.c_max;
 	if (mask || ft.active) {
 		ft.c_reports++;
 		ft.c_last = now;
@@ -503,6 +527,15 @@ ft_report(uint32_t mask)
 	ft.active = mask;
 	if (ended) {
 		ft_contact_end();
+	}
+}
+
+/* Retry the latest set, including final all-up, without counting a new sample. */
+static void
+ft_retry_report(void)
+{
+	if (ft.retry) {
+		ft.retry = !sweet_hid_touch_report(ft.active, ft.x, ft.y);
 	}
 }
 
@@ -588,10 +621,14 @@ ft_thread(void *arg, wait_result_t result)
 	(void)PE_parse_boot_argn("fuxitouch_poll_us", &poll_us, sizeof(poll_us));
 	(void)PE_parse_boot_argn("fuxitouch_idle_us", &idle_us, sizeof(idle_us));
 	(void)PE_parse_boot_argn("fuxitouch_offsuppress", &offsup, sizeof(offsup));
+	(void)PE_parse_boot_argn("fuxitbatch", &ft.batch, sizeof(ft.batch));
 	poll_us = poll_us < 1000 ? 1000 : poll_us;
 	idle_us = idle_us < poll_us ? poll_us : idle_us;
 	printf("FUXI TOUCH: starting in %u s (poll %u us active, %u us idle)\n", delay_s,
 	    poll_us, idle_us);
+	if (ft.batch) {
+		printf("FUXI TOUCH: report collections enabled (fuxitbatch=1)\n");
+	}
 	ft_sleep(delay_s * 1000u);
 	ft.gcc = ml_io_map(FT_GCC_PA, 0x1f0000);
 	ft.tlmm = ml_io_map(FT_TLMM_PA, 0x30000);
@@ -717,6 +754,7 @@ ft_thread(void *arg, wait_result_t result)
 				printf("FUXI TOUCH: controller reset event, sense on again -> %d\n", serr);
 			}
 		}
+		ft_retry_report();
 		uint64_t period = off ? off_abs :
 		    (ft.active || now - last_irq < recent_abs) ? poll_abs : idle_abs;
 		next += period;

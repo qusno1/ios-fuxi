@@ -26,4 +26,17 @@ for size in (m.MEM_SIZE, m.LEGACY_SIZE):
         decoded = value | index << 16 | ((req == 0x58) << 32)
         assert decoded == off
 assert m.MEM_SIZE == 5088*1024*1024
-print('PASS: full/1g ADT bounds, scratch, seven CPUs and >4 GiB USB offsets')
+# /chosen MACs: present on a fresh build, added to an old template without them.
+chosen = next(c for c in m.build().children if c.name == 'chosen')
+assert chosen.prop('mac-address-wifi0') == m.mkadt.SWEET_WIFI_MAC
+assert chosen.prop('mac-address-bluetooth0') == m.mkadt.SWEET_BT_MAC
+assert all(len(v) == 6 and v[0] & 3 == 2 for v in (m.mkadt.SWEET_WIFI_MAC, m.mkadt.SWEET_BT_MAC))
+old = m.build()
+oc = next(c for c in old.children if c.name == 'chosen')
+oc.props = [p for p in oc.props if not p[0].startswith('mac-address-')]
+old, _ = adt.parse(adt.serialize(m.ensure_mac_addresses(m.reserve_gpu(old))))
+oc = next(c for c in old.children if c.name == 'chosen')
+assert oc.prop('mac-address-wifi0') == m.mkadt.SWEET_WIFI_MAC
+before = len(oc.props)
+assert len(next(c for c in m.ensure_mac_addresses(old).children if c.name == 'chosen').props) == before
+print('PASS: full/1g ADT bounds, scratch, seven CPUs and >4 GiB USB offsets; /chosen MACs')

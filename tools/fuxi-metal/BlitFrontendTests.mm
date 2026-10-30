@@ -68,6 +68,20 @@ int main(){@autoreleasepool {
  [e endEncoding];refuses(c,^{[e synchronizeResource:buffer];});
  for(auto value:{550u,554u}){d.pixelFormat=(MTLPixelFormat)value;assert(![device newTextureWithDescriptor:d]);}
  d.pixelFormat=MTLPixelFormatR32Float;d.textureType=MTLTextureType1D;d.height=2;d.usage=MTLTextureUsageShaderRead;assert(![device newTextureWithDescriptor:d]);
+ // 3D sampled textures (the CoreAnimation colour lookup table): CPU slices round-trip; render targets, mip chains and linear buffers refuse.
+ {MTLTextureDescriptor *v=[MTLTextureDescriptor new];v.textureType=MTLTextureType3D;v.pixelFormat=MTLPixelFormatRGBA8Unorm;v.width=16;v.height=16;v.depth=16;v.usage=MTLTextureUsageShaderRead;v.storageMode=MTLStorageModeShared;
+  FuxiTexture *t3=(FuxiTexture *)[device newTextureWithDescriptor:v];assert(t3 && t3.textureType==MTLTextureType3D && t3.depth==16 && t3.width==16 && t3.mipmapLevelCount==1);
+  static uint8_t in3[16*16*16*4],out3[16*16*16*4];for(unsigned i=0;i<sizeof(in3);++i)in3[i]=(uint8_t)(i*7);
+  [t3 replaceRegion:MTLRegionMake3D(0,0,0,16,16,16) mipmapLevel:0 slice:0 withBytes:in3 bytesPerRow:64 bytesPerImage:1024];
+  [t3 getBytes:out3 bytesPerRow:64 bytesPerImage:1024 fromRegion:MTLRegionMake3D(0,0,0,16,16,16) mipmapLevel:0 slice:0];assert(!memcmp(in3,out3,sizeof(in3)));
+  uint8_t patch[8]={1,2,3,4,5,6,7,8};[t3 replaceRegion:MTLRegionMake3D(2,1,5,2,1,1) mipmapLevel:0 slice:0 withBytes:patch bytesPerRow:8 bytesPerImage:8];
+  [t3 getBytes:out3 bytesPerRow:64 bytesPerImage:1024 fromRegion:MTLRegionMake3D(0,0,0,16,16,16) mipmapLevel:0 slice:0];assert(!memcmp(out3+5*1024+64+8,patch,8));
+  @try{[t3 getBytes:out3 bytesPerRow:64 bytesPerImage:1024 fromRegion:MTLRegionMake3D(0,0,15,16,16,2) mipmapLevel:0 slice:0];assert(false);}@catch(NSException *e){(void)e;}
+  [t3 release];
+  v.usage=MTLTextureUsageRenderTarget|MTLTextureUsageShaderRead;assert(![device newTextureWithDescriptor:v]);v.usage=MTLTextureUsageShaderRead;
+  v.mipmapLevelCount=2;assert(![device newTextureWithDescriptor:v]);v.mipmapLevelCount=1;
+  v.depth=0;assert(![device newTextureWithDescriptor:v]);v.depth=16;v.textureType=MTLTextureType2D;assert(![device newTextureWithDescriptor:v]);
+  [v release];}
  [buffer release];[other release];[queue release];[device release];
  puts("PASS: M9n native blit protocol/overloads, 1D formats/views, alias snapshot pixels, retained owners, buffer strides/fill/sync, subresource/shape/options/format refusal");
 }}

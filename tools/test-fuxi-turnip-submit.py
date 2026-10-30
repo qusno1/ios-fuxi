@@ -32,7 +32,7 @@ struct vk_darwin_sync {struct vk_sync vk;enum darwin_sync_state state;uint32_t f
 struct vk_sync_wait {struct vk_sync *sync;};struct vk_sync_signal {struct vk_sync *sync;};
 enum vk_sync_wait_flags {VK_SYNC_WAIT_PENDING=1,VK_SYNC_WAIT_ANY=2};
 struct tu_u_trace_submission_data {unsigned gpu_ts_offset;};
-struct util_dynarray {unsigned count;NativeAdrenoAbiSubmitBuffer data[17];};
+struct util_dynarray {unsigned count;NativeAdrenoAbiSubmitBuffer data[130];};
 struct tu_darwin_queue_submit {struct util_dynarray commands;};
 #define util_dynarray_num_elements(p,t) ((p)->count)
 #define util_dynarray_element(p,t,i) ((p)->data+(i))
@@ -49,7 +49,7 @@ static kern_return_t dw_call(unsigned method,const void *in,size_t bytes,void *o
   const auto *r=static_cast<const NativeAdrenoAbiWaitFence *>(in);slice_seen=r->timeout_ns;clock_ns+=r->timeout_ns;++polls;return response;
  }
  assert(method==NativeAdrenoMethodSubmit && bytes==sizeof(NativeAdrenoAbiSubmit) && outbytes==sizeof(NativeAdrenoAbiSubmitReply));
- const auto *r=static_cast<const NativeAdrenoAbiSubmit *>(in);assert(r->buffer_count<=16 && !r->queue && !r->wait_fence);
+ const auto *r=static_cast<const NativeAdrenoAbiSubmit *>(in);assert(r->buffer_count<=128 && !r->queue && !r->wait_fence);
  ++submits;static_cast<NativeAdrenoAbiSubmitReply *>(out)->fence=reply_fence;return KERN_SUCCESS;
 }
 static void darwin_note_fence(uint32_t f) {assert(f==reply_fence);}
@@ -80,10 +80,10 @@ int main() {
  syncs[1].state=DARWIN_SYNC_UNSIGNALED;
  assert(vk_darwin_sync_wait_many(&dev.vk,2,waits,VK_SYNC_WAIT_ANY,0)==VK_TIMEOUT);
  assert(vk_darwin_sync_wait_many(&dev.vk,2,waits,VK_SYNC_WAIT_PENDING,0)==VK_SUCCESS);
- tu_darwin_queue_submit submit={};submit.commands.count=17;
+ tu_darwin_queue_submit submit={};submit.commands.count=129;
  vk_darwin_sync signal={};vk_sync_signal signals[]={{&signal.vk}};
  assert(darwin_queue_submit(&queue,&submit,nullptr,0,signals,1,nullptr)==VK_ERROR_DEVICE_LOST && !submits);
- submit.commands.count=16;
+ submit.commands.count=128;
  assert(darwin_queue_submit(&queue,&submit,nullptr,0,signals,1,nullptr)==VK_SUCCESS && submits==1 && queue.fence==7);
  assert(signal.state==DARWIN_SYNC_FENCE && signal.fence==7);
  submit.commands.count=0;

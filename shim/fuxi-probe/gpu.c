@@ -31,6 +31,7 @@
 #include "gpu-clock.h"
 /* XNU sets this once before cold start. Loader probes retain zero. */
 static unsigned g_gpu_selected;
+static uint64_t g_gpu_ddr_requested;
 /* ---- Fuxi-verified physical bases (research/device/probe-09/live.dtb) ---- */
 #define GPU_GCC_BASE      0x00100000ULL   /* gcc kalama-v2 @100000 (clock-controller) */
 #define GPU_GCC_GPU_PAGE  (GPU_GCC_BASE + 0x71000) /* gcc-kalama: gpu branch page */
@@ -561,7 +562,7 @@ static int g_active_bw(uint32_t bw[160])
    }
   }
  }
- return g_gpu_bw_packet(bcm, address[3], bw);
+ return g_gpu_bw_packet(bcm, address[3], g_gpu_ddr_row2(g_gpu_selected, g_gpu_ddr_requested), bw);
 }
 /* e[40..59]: five command/ACK records {sent, response, returned, error}.
  * Poll shared queue indices as well as interrupt status; reject malformed or

@@ -248,3 +248,89 @@ Keep everything outside git and pass it to builds through environment variables.
   (0x0 = 0x35a40) and REVID on both amps. The first write follows only after
   the reads succeed.
 - Path A milestone 2: glink-SMEM + QRTR + servreg, then the APM-up check.
+
+# Audio lane — port plan P-AU (speaker first, then microphone)
+
+Nothing below has been run on the fuxi device: every device effect is **not yet observed**. Sheng facts are from UniXNU's
+`docs/devices/sheng.md` Audio section (which records a device pass on sheng: all amps PLL-locked, 155 of 155 test-tone periods
+sent, capture 200 of 200 periods). Sheng is an SM8550-class board, so most of the DSP side carries over.
+
+## 8. What carries over from sheng and what does not
+
+| Item | Sheng | Fuxi | Verdict |
+|---|---|---|---|
+| ADSP PAS boot, QMP, RPMh proxy votes, SMEM/SMP2P/GLINK, IPCC | UEFI-side, firmware from modem_a `/image` | already done in the loader probe stage 2 (section 4, unobserved) | carries over; XNU-side owner still missing |
+| GPR packet codec, APM "SPF ready" query | `ShengGpr.c` | `xnu/fuxi-audio/fuxi_gpr.c` (this commit) | ported, host-tested |
+| AudioReach command framing, shmem map/write/read, PRM clock and block votes | `ShengAudioReach.c` | `xnu/fuxi-audio/fuxi_audioreach.c` | framing ported; **graph ids are sheng's** |
+| PRM clock ids (TX core 0x30c, VA core 0x307), macro and dcodec votes make LPASS registers reachable | observed on sheng | same SoC family | likely carries over (**GUESS**) |
+| DSP buffers: 32-bit address, stream index in the upper word, buffer in low DRAM outside the kernel window, SMMU in pass-through; a translating SMMU context resets the board | sheng default PA 0xd0000000 | the PA must be re-checked against fuxi's memory map and ADT | rule carries over, address does not |
+| Host clock: CoreAudio assumes 24 MHz, the board timer is 19.2 MHz; fix by patching the constant behind AudioGetHostClockFrequency | sheng plug-in | iOS image is the same, SM8550 timer is 19.2 MHz | likely carries over (**GUESS**), apply to `tools/fuxi-audio` |
+| Speaker amps | 6 x CS35L43, I2C 0x40-0x42 on QUP1 SE5 and QUP2 SE0, shared reset gpio90, secondary MI2S gpio121-124, ASP RX1 direct, DSP bypassed, 16-bit I2S 48 kHz, gain 18 dB | 2 x CS35L41, I2C 0x40/0x42 on QUP2 SE0, resets gpio183/gpio182, IRQ gpio99/98, receiver switch gpio68, TDM secondary gpio121-124, slots 0 (T) and 1 (B) | **device specific**; `ShengCs35l43.c` is a template only (different chip, register map not identical) |
+| Graph ids (subgraphs 0x4001/0x4005/0x4003/0x4007, instances 0x60xx) and the I2S sink param | sheng board topology | fuxi's ACDB topology is unknown; its speaker endpoint is TDM, not I2S | **device specific**, must be discovered |
+| Mic: WCD938x on the TX SoundWire master, TX and VA macros gated by the VA macro; AMIC3 / micbias 3 / ADC2 / codec DMA TX3 mono 48 kHz | sheng | fuxi DT has WCD938x, lpass-cdc tx-macro@6AE0000 and va-macro, AMIC1-5, micbias1-4 | codec side likely carries over; **which AMIC/micbias fuxi's mic uses is not known** |
+| GENI I2C core with 1-8 byte writes and 32-bit amp registers | `GeniI2c.c` (BSD) | `shim` has a touch-lane GENI driver | later port candidate |
+| Other BSD blocks: `QcomGlink/Smem/Smp2p/Qrtr/Rpmh/Mdt/Qmp` | sheng | none in XNU | later ports (P-AU2/P-AU3) |
+
+## 9. Steps, dependencies, firmware and gates
+
+Sources and licenses: UniXNU-sheng commit `08cde20edc32` (BSD-2-Clause-Patent), files under `package/` named in each ported
+header. hackios (APSL) was read for ideas only (its single RSC mutex).
+
+| Step | Work | Needs | Status |
+|---|---|---|---|
+| P-AU0 | read-only probe, loader ADSP PAS stage 2, HAL plug-in `tools/fuxi-audio` that counts and drops | section 4-6 | in tree, device result not yet observed |
+| **P-AU1** | GPR codec + APM readiness query, AudioReach framing, RSC arbiter, host tests, sync check | nothing | **done in this commit** (`tools/test-fuxi-audio.py`) |
+| P-AU2 | XNU owner for the ADSP: keep the loader-stage-2 boot and hand the state to XNU, or port Qcom{Mdt,Qmp,Smem,Smp2p}; wire the arbiter into `fuxi_wlan.c`; add a build hook for 0113 | P-AU1; ADSP firmware (below); an SCM caller in XNU or the loader hand-off | planned |
+| P-AU3 | GLINK `adsp_apps` channel (sheng: DSP offers 24 intents of 128 B and grants one 4 KiB intent on request), IPCC mailbox, TCSR hwspinlock for the SMEM FIFOs | P-AU2 | planned |
+| P-AU4 | APM readiness: run `fuxi_gpr_spf_*` until ready. First device experiment; recovery showed `apm is not up`, so a pd-mapper/servreg responder may also be needed (**GUESS**) | P-AU3 | planned |
+| P-AU5 | PRM: clock votes and macro/dcodec block votes (`fuxi_ar_prm_*`) | P-AU4 | planned |
+| P-AU6 | speaker graphs: device graph (TDM sink on LPAIF secondary, slots 0/1) + playback stream graph, shared-memory map and write loop | fuxi topology ids (below); buffer PA decision | planned, blocked on facts |
+| P-AU7 | amps: GENI I2C on QUP2 SE0, pin muxes (gpio0/1 I2C, 121-124 TDM), reset gpio182/183, read DEVID (0x35a40) first, then ASP RX1 direct, low gain, short tone | CS35L41 register init (see blockers) | planned |
+| P-AU8 | kernel audio service with the rings and control page of `ShengAudioAbi.h` (ideas; new ABI to write) feeding the `tools/fuxi-audio` HAL plug-in; apply the 19.2 MHz host clock fix | P-AU6, P-AU7 | planned |
+| P-AU9 | microphone: PRM TX/VA macro clocks, TX SoundWire master, WCD938x enumeration, capture graph (codec DMA TX3 source, read-shmem sink) | P-AU5, fuxi mic routing | planned, after speaker |
+
+### RPMh serialization (finding)
+
+`xnu/fuxi-wlan/fuxi_wlan.c:278` `rh_send_request` always uses ACTIVE TCS 0 for its callers and guards it with the plain
+`rh_poisoned` flag (`:276`, checked at `:281`, set at `:290`). That is a check-then-set with no atomic or lock, and it also does
+read-modify-write on the shared RSC IRQ-enable word (`:288`, `:291`, `:343`). Today it is safe only because the header comment
+says no other XNU code drives the apps RSC and the loader probe runs before XNU. The moment the audio owner votes in XNU (the
+ADSP proxy drop after handover, PRM follow-ups) next to WLAN QMP/ICC votes, two sequences can interleave, which is the hackios
+bug (audio DSP and modem asking through TCS 0 together). Using a different TCS per owner would not help: the IRQ-enable RMW and
+the status registers are shared. `fuxi_rpmh_arb.h` is the cure: a bounded-spin owner-tagged lock around program/trigger/wait/cleanup
+that poisons the arbiter on an uncertain sequence. The test drives 4 threads over a modelled TCS: unguarded runs saw thousands of
+overlaps, guarded runs saw none. It is **not yet wired** into `fuxi_wlan.c` (that file belongs to the WLAN lane and patch 0099 is
+regenerated from it; the wiring is two lines: enter before the precheck and leave on every return, with `ok` = result 0).
+
+### Firmware to pull from the phone (never in git, never downloaded here)
+
+As in section 6. Extra items that matter for the speaker path: the ACDB (`Tutu_acdb_cal.acdb`, `Tutu_workspaceFileXml.qwsp`) and
+the Lineage/vendor `usecaseKvManager.xml`, `resourcemanager_kalama_mtp.xml` and `card-defs.xml`, because they hold the real
+subgraph/module instance ids for `PAL_DEVICE_OUT_SPEAKER` -> `TDM-LPAIF-RX-SECONDARY`. Sheng needed no amp firmware (DSP bypass),
+so `cs35l41-dsp1-spk-*` files are not required for the first tone; expect harsh sound and no speaker protection, so keep the first
+tone short and quiet.
+
+### Boot-args and gating (proposal)
+
+The kernel cmdline is nearly full, so: one bitmask `fuxiaudio` (shorter than sheng's two args), preferably carried as an ADT
+`/product`/`chosen` option written by `mkadt-fuxi.py` so it costs no cmdline bytes; default 0 = nothing changes.
+Bits: 1 ADSP up and SPF query, 2 PRM votes and speaker graph with a 750 Hz tone (short, attenuated), 4 amps, 8 kernel audio
+service for the HAL plug-in, 16 microphone capture self-test. Higher bits imply lower ones. A second arg for the period buffer PA
+only if the ADT cannot carry it. The HAL plug-in stays opt-in through `fuxi-sys-root.py --audio-plugin`.
+
+### Blockers and facts needed
+
+1. Fuxi ACDB/topology ids for the TDM speaker and the capture path (files above), plus the AudioReach TDM interface param id and layout.
+2. CS35L41 register init for ASP RX1 direct (clock/PLL reference from the TDM SCLK, ASP enables, gain, global enable, DEVID check).
+   `ShengCs35l43.c` shows the shape only; Linux's driver is GPL and is ideas only. Needed: a non-GPL register list or a carefully
+   reconstructed one verified by DEVID reads and PLL-lock status before any audio.
+3. A reserved low-DRAM window for the DSP buffers and a check that audio streams stay in SMMU pass-through under the fuxi hypervisor setup.
+4. An SCM/PAS caller inside XNU (or an agreed hand-off from the loader after stage 2) and the ADSP firmware extraction.
+5. Which AMIC/micbias fuxi's built-in microphone uses (mixer_paths from the vendor image).
+6. Whether the APM needs a servreg/pd-mapper responder (the recovery log suggests so; sheng's guide does not mention one).
+
+### Tests
+
+`python3 tools/test-fuxi-audio.py` builds `xnu/fuxi-audio/*.c` with ASan/UBSan against `tools/fuxi-audio-host/*_host.c`:
+GPR 37 checks, AudioReach 182 checks (sheng ids), arbiter 24k checks. `python3 tools/sync-fuxi-audio.py --check` verifies patch
+`xnu/patches/0113-fuxi-audio.patch` (new files under `bsd/dev`, in no build list, so the kernel build is unchanged).

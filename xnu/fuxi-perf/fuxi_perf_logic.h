@@ -1,6 +1,37 @@
 /* Pure policy shared with offline tests. Frequencies always come from EPSS LUT. */
 #ifndef FUXI_PERF_LOGIC_H
 #define FUXI_PERF_LOGIC_H
+/* OSThermalPressureLevel wire values used by OSThermalNotification.h:
+ * nominal=0, moderate=1, heavy=2, trapping=3, sleeping=4. This is not
+ * NSProcessInfoThermalState's four-value scale. No sleeping is emitted:
+ * this governor has no platform sleep/shutdown policy.
+ */
+enum { FP_TP_NOMINAL, FP_TP_MODERATE, FP_TP_HEAVY, FP_TP_TRAPPING, FP_TP_SLEEPING };
+/* Rises publish at once; a fall waits until the level has held for `hold`
+ * ticks. Without it the rise latch toggled the level 11 times in the first
+ * 90 s of a boot (observed), and each change wakes every notify client. */
+static int fp_pressure_hold(int previous, int next, uint64_t now, uint64_t *since,
+    uint64_t hold)
+{
+ if (next < previous && previous >= 0 && now-*since < hold) return previous;
+ if (next != previous) *since = now;
+ return next;
+}
+static int fp_pressure_level(int previous, int valid, int temp, int blocked,
+    unsigned hot, unsigned limit, unsigned resume)
+{
+ /* Missing quorum is at least heavy; never relax a prior trapping state
+  * on missing data. The guard independently cuts all high votes. */
+ if (!valid) return previous >= FP_TP_TRAPPING ? FP_TP_TRAPPING : FP_TP_HEAVY;
+ /* Inclusive entry, 4 C hysteresis on heavy/trapping; moderate follows
+  * the governor's rise/predictive/recovery latch as well as its hot trip.
+  * limit/hot/resume may be lowered by the existing governor boot args. */
+ if (temp >= 770 || (previous >= FP_TP_TRAPPING && temp > 730)) return FP_TP_TRAPPING;
+ if (temp >= (int)limit || (previous >= FP_TP_HEAVY && temp > (int)limit-40)) return FP_TP_HEAVY;
+ if (blocked || temp >= (int)hot ||
+     (previous >= FP_TP_MODERATE && temp > (int)resume)) return FP_TP_MODERATE;
+ return FP_TP_NOMINAL;
+}
 static unsigned fp_khz(uint32_t row)
 {
  return row >> 30 ? (row & 255u)*19200u : 300000u;
@@ -21,10 +52,13 @@ static int fp_level(const uint32_t *rows, unsigned count, unsigned cap, unsigned
  *khz = freq;
  return best;
 }
+/* A new boost may start at or below fp_start dC (fuxiperfstart, default 600);
+ * a running one continues to 680. The hot/limit trip still vetoes both. */
+static unsigned fp_start = 600;
 static int fp_want_boost(int boosted, int valid, int temp,
     uint64_t now, uint64_t input, uint64_t swap, uint64_t hold)
 {
- if (!valid || temp > 680 || (!boosted && temp > 600)) return 0;
+ if (!valid || temp > 680 || (!boosted && temp > (int)fp_start)) return 0;
  int recent_input = input && now >= input && now-input <= hold;
  uint64_t activity = input > swap ? input : swap;
  int recent_activity = activity && now >= activity && now-activity <= hold;

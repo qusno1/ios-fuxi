@@ -16,6 +16,7 @@ FILES = {
     'bsd/dev/sweet_spmi.c': 'sweet_spmi.c',
     'bsd/dev/fuxi_touch.c': 'fuxi_touch.c',
     'iokit/Kernel/arm/hid/SweetHID.cpp': 'SweetHID.cpp',
+    'iokit/Kernel/arm/hid/LICENSE.NativeHidInput': 'LICENSE.NativeHidInput',
     'bsd/kern/fuxi_amfi.h': 'fuxi_amfi.h',
     'bsd/dev/fuxi_key_state.h': 'fuxi_key_state.h',
     'bsd/dev/sweet_spmi_bus.h': 'sweet_spmi_bus.h',

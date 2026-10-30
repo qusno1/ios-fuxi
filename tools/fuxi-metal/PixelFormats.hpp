@@ -24,7 +24,9 @@ inline bool linearImageFits(uint64_t image,uint64_t row,uint64_t width,uint64_t 
 }
 // A 1D image must retain its dimension through image creation and shader views.
 // Height-one 2D storage alone cannot satisfy a SPIR-V Dim1D sampled image.
-inline bool textureShapeAccepted(uint32_t type,uint32_t height,uint32_t usage) {
- return type==2 || (type==0 && height==1 && (usage&1) && !(usage&4));
+// A 3D image is sampled-only and single-level: no 3D render target, storage or mip chain.
+inline bool textureShapeAccepted(uint32_t type,uint32_t height,uint32_t usage,uint32_t depth=1,uint32_t levels=1) {
+ if(type==7)return depth>=1 && levels==1 && (usage&1) && !(usage&4);
+ return depth==1 && (type==2 || (type==0 && height==1 && (usage&1) && !(usage&4)));
 }
 }

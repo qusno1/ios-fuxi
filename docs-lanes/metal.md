@@ -776,7 +776,8 @@ one client and one hardware job) still apply; allocation failure returns nil.
 
 `Backend.hpp` directly dlopens `/usr/local/lib/libvulkan_freedreno.dylib` after
 setting the same service/open/debug environment as M3: NativeAdrenoGpuPublished,
-open type 0, TU_DEBUG=nocb and MESA_LOG_LEVEL=debug. It requires the observed
+open type 0, TU_DEBUG=nocb and MESA_LOG_LEVEL=warning unless the environment
+already sets it (info printed one line per submit). It requires the observed
 Qualcomm device identity. Operations use vkCmdFillBuffer/vkCmdCopyBuffer, explicit
 host/transfer and transfer/transfer barriers, mapped-memory flush/invalidate,
 and a finite **2 s fence wait**. Commit is synchronous; the owner mutex
@@ -1875,11 +1876,19 @@ with the IRQ bit, restores BOTH/IFPC and waits for idle. Context reset is emitte
 on every return from the present context, including the first client submit.
 RBBM interrupt delivery remains masked; no GIC/IRQ completion is claimed.
 
-WaitFence sleeps in 1 ms slices and returns `kIOReturnTimeout` for a user or
-hardware deadline. Zero timeout observes once. An independent delayed callback
+WaitFence sleeps in `fuxigpuwaitus` slices (default 100 us) without holding the client lock,
+and returns `kIOReturnTimeout` for a user or hardware deadline. Zero timeout observes once. An independent delayed callback
 checks every 2 ms, even when no client calls WaitFence, and declares a pending
 job lost at 100 ms. Completion observed after the deadline wins if the ring is
 already retired. Scheduling can delay observation beyond these intervals.
+Kernel-side call cost (not yet observed on device): Submit, BoMap and BoFree
+observe a pending job once instead of waiting for the 2 ms callback, so a busy
+retry succeeds as soon as the fence is written. BoMap walks pmap once per 16K
+page; BoFree keeps its TLB invalidate; read-only
+imports are cleaned at submit but not invalidated at retirement; BoAlloc looks
+up one physical segment per run. BoAlloc still zero-fills (see source comment).
+The SWEET FB stats cadence also prints `FUXI GPU ABI: calls n/avg/max us ...`
+per selector plus lock wait, segment walk, zero fill and sleeps, then restarts.
 A client fault/hang permanently disables GPU submission for this boot, drains
 GBIF, holds reset and faults SID0/1, allowing CPU presentation to continue.
 Failed drain quarantines the wired BO references until reset. There is no
@@ -2096,3 +2105,749 @@ The ADT remains byte-identical, including seven CPUs, pinned UFS root and
 | `shim/out/fuxi-metal1-payload.bin` | `781e358637e37205e6bc1140406d7965801293516ad74c9453a733273969eeb2` |
 | `shim/out/fuxi-metal1-boot.img` | `c430735773e9b97f0fa60f37244da085ab219ad97c46224dbf2f297834b59851` |
 | `tools/out/fuxi-gpu-abi-test` | `fc04e8157061a21d6f713197625010006e28b77b56c01cddf1d38ffd5cd85ae1` |
+
+## CA scheduled wait and commit reservations
+
+2026-10-26. Host-verified only; no device/120 fps result. The supplied profiler
+finds about 19% of CA's display thread in the scheduled wait; supplied frame
+traces suggest about 4 ms of waiting between commit and swap. Letting the next
+encode overlap submission/GPU work is the performance hypothesis, not a measured
+result of this change.
+
+**Previous behavior, facts from code:** without overlap, commit synchronously
+submits, waits for the fence and retires caches; `waitUntilScheduled` is a no-op.
+With overlap, caller-side `reserveOverlap` takes an in-flight semaphore and
+reserves serial `_submitQueue` order (including explicit enqueue order). Commit
+captures no-copy CPU bytes and releases `_commitReady`. The worker waits for
+older queue entries, takes sorted exclusive `SurfaceLease`s, refreshes shadows
+and calls `Backend::submit`. Backend can wait for a free slot, full drain or
+host-range conflict before recording, flushing and calling `QueueSubmit`.
+Successful submission sets `_scheduled`/Scheduled status; empty submissions
+also schedule. Event-split work can set the flag on the first submitted chunk.
+`waitUntilScheduled` returns if already scheduled/finished/error, otherwise waits
+for `_scheduledGroup`, released after the worker publishes scheduled handlers;
+that wait can therefore include handlers. `commitAndWaitUntilSubmitted` commits,
+waits and reports scheduled/no-error. It need not await this frame's fence, but
+admission, surface reuse and backend waits can transitively await older fences.
+
+The supplied CA stack calls `MetalContext::flush(true)` immediately before IOMFB
+swaps the drawable IOSurface. The inferred requirement is that swap must not
+copy an incomplete surface, rather than requiring the CPU to observe Vulkan
+submission. This is an inference about this CA path, not all private Apple uses.
+
+**Kernel ordering, facts from the original reservation change:** swap saved
+the newest record/`fDirty`; the timer copied it later. The FIFO correction
+below supersedes that mailbox behavior. Normal IOSurface writer locks count
+`gpuWriters` under `sweet_gpu_lock` after waiting for an older display copy of that surface.
+The worker holds its lease from before submission through render-fence/cache
+retirement. GPU copy rejects writers/quarantine (owned mode returns 3 and
+preserves dirty work without CPU fallback). `fuxi_gpu_scanout_reserve` also
+observes the client fence/ring-idle state via `fg_abi_observe`, retires imported
+caches/restores TTBR, and excludes new client submissions until copy ownership
+is established. `sweet_surface_gpu_poll` polls **the display copy**, retaining
+its exact source until fence/drain; it cannot track an unsubmitted Metal render.
+Double scanout publishes the completed back buffer only after transfer/TE/START
+guards pass. The previous CA wait ensured the worker had acquired the producer
+lease before swap; same-ring order alone cannot protect an early unsubmitted
+render.
+
+**Enable early CA waits** with these existing exact switches together; no new
+`fuxigpuperf` bit:
+
+```
+fuxigpuoverlap=1 fuxigpusubmit=1 fuxigpuscanout=1 sweetfb_noconsole=1
+```
+
+Only backboardd changes behavior; any missing/invalid switch keeps its previous
+wait. Keep the existing GPU/ABI and qualified panel/TE/double-scanout setup;
+`fuxigpupipelined=1` remains independent. Startup logs `FUXI MTL: CA scheduled
+wait early=1 commit-reserved surfaces`. Use the matching frontend/kernel.
+
+Commit now synchronously acquires a deduplicated **counted pending lease** on
+all retained imported surfaces with `IOSurfaceLock(kIOSurfaceLockAvoidSync)`
+(option 2), before returning or releasing `_commitReady`. The updated kernel
+increments `gpuWriters` without sleeping for old display readers/copies.
+The worker still needs its normal exclusive writer lease before touching pixels.
+Queue order stays caller-reserved; in-flight admission moves to the worker,
+so a third commit cannot await an older GPU flight on CA. `waitUntilScheduled`
+returns immediately on this path; commit-and-wait reports accepted/no currently
+known error. Scheduled status and handlers still follow real backend scheduling;
+explicit enqueue, events, completion/presentation handlers and completion waits
+retain their ordering and behavior.
+
+Before copying any layer, guarded present retains the exact source objects and
+atomically checks all of them for producers/quarantine, holding a read reservation
+through CPU/GPU copying. A pending surface defers the **whole** record, leaves
+the previous panel frame, restores dirty work and keeps polling without another
+swap. The FIFO correction below retains pending records instead of replacing
+them with each newer swap. The guard covers CPU/multi-layer/unsupported-GPU
+fallback too. If pending commit races an existing read, its count increments immediately but the worker's
+normal lock waits for that read, and for the copy fence if a GPU copy started.
+If commit wins first, present cannot start reading. Render fence/cache retirement
+precedes the final producer unlock. This mutual exclusion proves ordering without
+assuming render-before-copy GPU ring order; multiple pending producers remain
+unreadable until **all** retire. Existing cache/ring/copy/publication guards stay.
+
+Success releases both leases before callbacks. Errors after reservation keep it
+closed, even known pre-submit errors, so a swapped partial multi-submit render
+cannot become readable. Unknown DMA retains existing poisoned ownership too.
+Such surfaces may remain undisplayable until teardown/reboot. Reservation failure
+returns failure and submits no render; reader admission/allocation failure defers.
+GPU flights remain bounded to the queue limit/two slots, but queued commands,
+resources and snapshots can accumulate if encoding outruns retirement. Physical
+framebuffer writers and clients bypassing normal writer leases remain outside
+this contract.
+
+The original backend drain was retained here (superseded by
+[Index admission and unchanged sampled shadows](#index-admission-and-unchanged-sampled-shadows)):
+`hostUses` tracks noncoherent allocations only,
+but indexed validation also CPU-reads coherent index bytes; the opaque shadow
+`prepare` callback can CPU-write shared coherent backing. Replacing these drains
+with today's range test misses coherent GPU/CPU conflicts and aliases. Narrowing
+requires complete read/write and prepare-destination metadata. These waits now
+happen on the opted-in worker.
+
+`fuxigpuframetrace=1` (or 2) adds `sched_wait=p50/p90` ms, measuring actual
+entry-to-return of overlap `waitUntilScheduled`, including immediate returns and
+excluding commit. An atomic queue handoff attributes the most recent wait to
+its **next commit**, like the existing prior-completion fields; first sample is
+zero. Compare steady-state `sched_wait`, `commit_call`, `admission_wait`,
+`submit_queue`, `slot_wait` and `commit_gap`; small waits alone do not prove fps.
+
+Verification: portable `test-fuxi-metal-frontend.py` ASan/UBSan models pass;
+new `OverlapFrontendTests.mm` paused-queue/recording, enqueue/handler ordering and
+failure tests are **not compiled/run on Linux** and still need macOS.
+`test-fuxi-metal-overlap.py` passes lavapipe two-flight pixels/resource lifetime,
+noncoherent exclusion and loss/timeout; `test-fuxi-metal-frametrace.py` passes.
+`test-fuxi-gpu-scanout.py`/`test-fuxi-unixnu.py` pass production-code sanitizer
+models for pending deferral/retry, multiple producers, CPU/read/copy exclusion,
+real trap option/error wiring and quarantine, plus existing TE/double failures.
+Complete changed surface/framebuffer translation units and unchanged Adreno/
+console integration pass AArch64 syntax against saved XNU headers/flags; no
+kernel link or macOS/iOS frontend build. `test-fuxi-adreno-mapping.py` passes.
+Patches **0106** and **0108** are regenerated; **0098** is unchanged. Every
+`tools/sync-fuxi-*.py --check` passes. Device qualification still must establish
+IOSurface option propagation, image/cache correctness, failure behavior,
+backlog/latency and CA/START cadence; no phone access or deployment occurred.
+
+### Presentation FIFO correction
+
+2026-10-27. The supplied device observations on 7a0decf show the intended
+zero scheduled wait, but about 23 shown frames/s and about 36 present deferrals
+per shown frame. Code confirms the starvation mechanism: `AppleCLCD::swap`
+replaced its single record and counted dirty replacement as not shown;
+`present` rejected a pending/active producer, restored only dirty state, and
+writer retirement did not wake the presenter. Faster CA commits could therefore
+replace each pending record before the next poll could consume it.
+
+CLCD now keeps three waiting records, retaining the exact source objects at
+swap. It selects the oldest readable record under the queue lock and takes the
+existing all-layer read reservation before removing it. An unreadable head stays
+queued without a drop; the first readable newer record may skip unreadable
+predecessors. Overflow drops the oldest waiting record. Copying runs outside the
+queue lock, so swaps can arrive during a copy. A ring/ownership refusal restores
+the selected record to the head; if arrivals filled the FIFO meanwhile, that
+older deferred record is the overflow victim. The last accepted record is
+retained separately for redraw and exact failed-copy CPU replay, ahead of newer
+queued swaps. This bounds waiting records, not frontend command-buffer backlog.
+
+The final nonquarantined writer decrement queues one coalesced thread call.
+Its worker enters the existing workloop gate and arms the existing presentation
+timer at 1 us only for dirty, powered-on, unheld work. Unlock performs no display
+work or timer manipulation. Registration/unregistration uses the surface lock;
+teardown unregisters and cancels/waits for the call. Early wakeups preserve
+notification deadlines/counts, including before scanout ownership is acquired.
+
+A completed double-buffer copy waiting for TE publication cannot be overwritten
+by another GPU copy. CLCD keeps polling it before selecting another FIFO entry.
+All existing CPU/black-fill, double re-entry, console, drain, quarantine and stop
+guards remain. SWEET FB completed-frame accounting advances at successful START
+(or the legacy kick), including a deferred publication retry; submission and
+failed copies do not count. The FUXI SCANOUT 120-copy summary still counts copies,
+not panel transfers. Neither counter proves optical panel completion.
+
+The existing 600-frame SWEET FB line adds cumulative `queued_pending`,
+`fifo_overflow`, `ready_skips` and `ownership_defers`. The first counts record
+read-admission refusals, including pending/active writers and quarantine; the
+last counts fence/ring/ownership/drain/publication retry deferrals. These are
+poll/record attempts, not frame losses. `not shown` counts only overflow plus
+ready skips since the preceding stats line; queued pending records are excluded.
+No new per-frame log or logging cadence is added.
+
+Host coverage exercises production FIFO order, multiple writer deferral and
+retirement, final-release wake/coalescing/gate delivery, oldest overflow, ready
+skips, source retention, arrivals during copy, exact CPU replay, TE back-buffer
+protection and publication accounting, plus existing fail-closed paths. The
+portable frontend/lease and overlap tests and saved-XNU AArch64 syntax checks
+remain applicable. Native Objective-C frontend execution and real GPU/cache,
+TE/START cadence, image integrity and bounded device latency still need device
+qualification; no phone access, deployment, kernel link, push or CI run occurred.
+The frontend reservation/fence-retirement contract is unchanged. Generated
+patches changed: **0098**, **0106**, **0108**; **0100** is unchanged.
+
+Validation passed: 14 related host suites (including production scanout/unixnu,
+frontend lease models, lavapipe overlap and external KMD submit), all 12 sync
+checks, and complete framebuffer/surface/Adreno/console/vfs/UFS syntax with saved
+XNU headers. Native Objective-C tests are skipped on Linux.
+
+### Retirement queue and source-reuse pacing
+
+2026-10-27. **Device results for this revision: not yet observed.** See
+[the scanout pacing audit](gpu-scanout.md#source-consumption-before-start-and-retirement-queue-isolation)
+for the supplied 43.7 shown/s baseline, short shared-cache conclusions,
+SwapWait/source-hold contract, latency accounting and qualification criteria.
+CA's ordinary reuse waits pass individual page IDs and mode 0; displayed-frame
+checks use mode 1. The cache does not prove queue-acceptance retirement or the
+runtime CA page count. Source consumption after clean-copy retirement now
+releases mode 0 and display holds before TE/START, while mode 1 remains tied
+to START. Writer/read/cache/unknown-DMA guards remain mandatory.
+
+The overlap retire queue now ends after backend fence/cache retirement,
+producer-lease destruction and flight-slot release. A separate serial finish
+queue handles scheduled-group waits, gate/trace reporting, completion delivery
+and command-resource cleanup. This prevents a slow finish tail from delaying
+the next lease retirement. Submit ordering, actual scheduled status, handler
+order, completion waits, backend conflict/index/shadow drains and poison
+retention remain. Slow completion work can retain completed command resources;
+the two GPU slots do not bound the early-submit command backlog.
+
+`retire_queue=p50/p90` ms measures dispatch-to-retirement entry in the existing
+frame trace; other retirement, submit and fence fields retain their meaning.
+`wall` starts at commit and ends after lease release; it excludes the separate
+`cpu_before_commit`. No comparison of p50 wall/submit/GPU time isolates a single
+extra delay. The new native paused-finish test requires that three same-surface
+commands retire and release every lease/flight while completion work is paused,
+then deliver their completion handlers in order. Native `.mm` compilation and
+execution still require macOS; Linux portable tests cannot establish that result.
+
+## Display-thread CPU allocation and encoding cost
+
+2026-10-27. **Device results for these changes: not yet observed.** The supplied
+60 s / 30,000-sample display-thread profile reports 49% runloop idle, 513 texture
+`vkAllocateMemory` samples, about 1,250 record-copy samples, 174 operation-vector
+growth samples, 1,382 registry samples and 227 SwapWait samples. The supplied
+trace p50s are CPU-before-commit 6 ms, backend submission 3 ms, GPU execution
+6.3 ms and commit gap 13 ms, with about 48 fps and 17% multi-tick intervals.
+These describe the preceding device build; they are not host test results.
+
+`Backend::allocateTextureUnlocked` now takes device-local memory from an exact
+requirements-size/alignment, Vulkan-format/usage and memory-type pool. The pool
+holds at most **32 allocations / 64 MiB**, within the existing **256 MiB** total
+resource charge. It caches memory, not images: each new image starts undefined
+with a fresh layout/defined-level state. `destroyTextureUnlocked` donates only
+successfully created ordinary allocations after the final reference disappears.
+Async `submit` pins every used texture before QueueSubmit and drops those pins
+only after fence/cache retirement. Synchronous submission and destruction share
+the backend mutex. Imports, borrowed buffer-image memory and failed creations
+never donate memory; IOSurface lifetime, lock, use-count and ownership semantics
+are unchanged. Device loss poisons the backend even without a live flight;
+poisoned pools neither reuse nor free memory, retaining containment semantics.
+
+Unused entries expire after **five seconds**, checked by the maintenance worker
+once a second and on ordinary texture allocation. Resource-budget pressure,
+texture allocation OOM (one retry), Darwin memory-pressure warning/critical
+notifications and clean close trim quiescent cached allocations. Notification
+cancellation completes before backend destruction. Trimming can contend for the
+backend mutex; it never waits for a live texture to become recyclable. The
+maintenance thread now also runs when persistent shader caching is disabled.
+
+The existing five-second `FUXI MTL: backboardd frames=...` line appends lifetime
+**`tex_pool_hits`, `tex_pool_misses`, `tex_pool_trims`, `tex_pool_bytes`**.
+Hits/misses count ordinary texture-memory requests, trims count cached memory
+objects actually freed, and bytes is the current retained-memory gauge (including
+quarantined idle memory after loss). Capacity refusals immediately free the
+returning allocation and do not count as cached-object trims. There is no new
+per-frame logging. Existing frame-trace `allocations` counts actual Vulkan
+allocations, so a hit contributes zero.
+
+**Slab sub-allocation (N167 follow-up; device effect not yet observed).** Device-local
+images up to 4 MiB are bound at aligned offsets inside shared 16 MiB `VkDeviceMemory`
+slabs (`SlabMemory.hpp`, at most 8 slabs, charged to the resource budget when the slab
+is created). A texture's range is returned only from `destroyTextureUnlocked`, i.e.
+after the submit that pinned it has retired, so a block is never reissued while the
+GPU may use it. Larger images keep the exact-class block pool (now 256 entries, 30 s
+idle trim). Texture aliasing checks compare memory plus offset range
+(`Backend::memoryAlias`). Empty slabs are freed after 30 s idle except the newest per
+type, and under budget pressure. `fuxigpunoslab=1` restores the pool-only path.
+The backboardd line appends **`tex_pool_miss_causes`** (cold, inflight, type, slack,
+small, idle_trim, pressure, reject_full, reject_budget; each pool miss counted once),
+and **`slab_hits`, `slab_grows`, `slab_grow_cold/frag/full`, `slab_grow_refused`,
+`slab_frees`, `slab_trims`, `slab_bytes`, `slab_free_bytes`**. A slab grow is one
+kernel allocation; steady state should show `slab_hits` growing with `slab_grows` flat.
+
+`record` previously copied the **2 x 16 `BufferBind` array, 768 bytes** with its
+explicit `memcpy(op.buffers, _buffers, sizeof(_buffers))`. These are pointers,
+offsets and flags, not CA's vertex/index payload. It also copied `_state` into
+a temporary `Operation` and moved that into `_ops`; the LP64 production operation
+is **1,712 bytes**. The supplied `+0xfec` PC cannot be mapped conclusively to
+one compiler-generated copy without that build's binary/symbol mapping. These
+are the exact source-level copies in that location, rather than an inferred
+inline-data length. Bindings now live in `_state.buffers`; `record` constructs
+the snapshot directly in `_ops`, eliminating the separate 768-byte binding copy
+and temporary-to-vector move. One immutable state snapshot per draw remains.
+
+Each queue recycles up to four empty operation vectors within **8 MiB**, reserving
+256 operations initially and remembering the bounded completed-command high-water
+capacity. A first larger workload can still grow; warmed commands reuse storage.
+Live/queued commands never share vectors; overflow storage is destroyed with its
+command. Completion returns storage, and abandoned commands return it at dealloc.
+Backend submission still makes its existing per-submit working vector copy.
+
+`setBytes` already copied each payload once, but allocated a Vulkan buffer for
+every call. It now copies once into a command-owned upload ring of **64 KiB**
+blocks, with 256-byte slice alignment and zeroed 16-byte tail padding. Each
+binding records its logical end in existing `BufferBind` padding, keeping the
+24-byte binding / 1,712-byte operation size. Translator input, descriptor range
+and vertex-fetch checks honor that end instead of the block's spare capacity.
+Caller mutations and later setters cannot change an older draw's snapshot.
+A command is limited to 64 blocks (**4 MiB**); a queue retains at most eight
+retired blocks (**512 KiB**) until queue destruction. Live blocks remain charged
+and retained through completion; loss discards them from reuse. This is bounded
+upload storage, not a cache for imported or general-purpose buffer ownership.
+
+Read-only iOS 16.7 cache conclusions (facts only, no Apple code/binaries tracked):
+`IOMobileFramebuffer`'s `kern_CopyProperty` queries the opened framebuffer
+service in plane **`IOService`**, allocator null, options **0** (no recursive or
+parent-search bits). QuartzCore's `copy_display_property` fallback likewise
+uses the display service, `IOService`, options 0. In this cache,
+`IOMFBDisplay::begin_work_interval` starts at **0x1882c1e38**; **+0xf8** is
+**0x1882c1f30**, after work-interval start, not a property-search call site.
+Its direct calls and resolved heartbeat/minimum-duration paths do not establish
+a searched key. Thus the supplied stack attribution does **not** identify a
+well-defined missing property, and absence alone does not establish a recursive
+walk. **The key remains unresolved; no AppleCLCD property is fabricated.**
+A matching caller PC/build mapping is needed to attribute those registry samples.
+
+Code identifies synchronous WaitFence candidates, not the caller of the older
+uncaptured poll sample: non-overlap `commitSynchronous` submits without a
+retirement ticket; CPU texture `getBytes`/`replaceRegion` transfers do the same;
+event-split chunks also synchronously retire before crossing the CPU event.
+`Backend::submit` then calls `WaitForFences` before cache invalidation/return.
+Overlap's final chunk instead waits in the retire worker. Backend slot/index/
+shadow drains wait on its condition variable for prior retirement, not directly
+in the kernel poll. `allocateTextureUnlocked` and `record` contain no explicit
+fence wait; their driver calls cannot be attributed to the uncaptured stack.
+`FuxiAdrenoUserClient::wait` sleeps between `fuxi_gpu_abi_poll` attempts using
+`delay(waitPollUs)` (default 100 us). None of these waits is proven unnecessary;
+removing CPU-read/write or source/cache retirement guards would be incorrect.
+SwapWait/TE/transfer guards are also unchanged by this frontend-only revision.
+
+Expected benefit is fewer kernel BO allocations and fewer render-state copies
+and heap growth stalls. At 48 frames/s the three sampled allocation/copy/growth
+sites represent roughly **0.36 / 0.87 / 0.12 ms per frame** of sampled thread
+residence (about **1.35 ms/frame total opportunity**, not a promised saving).
+Residual snapshot copies, misses, scheduling, GPU execution and display waits
+remain. Registry and fence samples have no claimed saving. No additive latency
+budget or tail bound follows from these samples: stable 60 fps / all frames
+under 16.6 ms and more frames under 8.3 ms still require device qualification.
+
+Validation: portable frontend/policy/storage/upload tests, production Vulkan
+memory-pool tests (software ICD, ASan/UBSan, loss/timeout), backend, frame-trace,
+unixnu and scanout suites pass. Native `EncodingFrontendTests.mm` adds actual
+selector/storage/slice/reuse checks; native compilation/execution and Darwin
+memory-pressure delivery remain unverified on Linux. All twelve sync checks
+pass. Regenerated **0098**, **0106**, **0108** are byte-identical; **no generated
+patch changes**. No kernel or external Mesa/metal2vulkan/NativeMetal source
+changes, device access, deployment, firmware download, push or workflow run.
+
+## Index admission and unchanged sampled shadows
+
+The shadow-reuse portion below is historical and has been reverted after device
+measurement; see [Restore simple texture shadows](#restore-simple-texture-shadows).
+The read-only-index admission remains in effect.
+
+2026-10-27. **Device results for this revision: not yet observed.** The supplied
+227-frame backboardd trace on iOS 16.7 / FuxiMetal `78aaa3a` reports
+`wait_reasons=drain:180,conflict:0,slots:0`, slot-wait p50/p90 **6.312/8.160 ms**,
+submit queue **3.0/8.1 ms**, QueueSubmit **1.04 ms**, commit gap **12.5/33.3 ms**,
+GPU execution p50 about **6–8.7 ms**, wall p50 **24 ms**, and cadence ticks
+**1:192,2:21,3:1,4+:13**. These are the preceding device baseline, not results
+of these changes. They support the serialization diagnosis, not a measured
+60/120 fps improvement.
+
+`Backend::submit` previously drained whenever a retirement ticket accompanied
+any `Operation::indices`. The protected read is the CPU `memcpy` scan of
+`indices->contents + indexOffset + indexWidth*i`: it finds the largest index,
+excluding primitive restart for strips, then checks fixed-function attribute
+fetch bounds with `vertexFetchFits`. The translator draw planner receives only
+length/offset/type metadata, not those bytes. An earlier GPU fill, copy,
+image-to-buffer readback, mapped attachment alias or storage-buffer shader could
+otherwise change an index during inspection, or leave noncoherent host bytes
+stale until retirement. `hostUses` alone cannot protect this: it intentionally
+excludes coherent allocations. Same-command GPU-written draw input still needs
+a separate submission; inspecting old bytes cannot validate future GPU results.
+
+Each live slot now retains **all resource uses and possible GPU writes**, separate
+from its existing noncoherent cache-maintenance uses. Writes include explicit
+buffer destinations, color/clear/upload/copy/mip texture destinations (including
+borrowed backing), and storage buffers from the **final runtime draw plan**.
+Only a final-module explicit `NonWritable` proof removes a storage writer;
+unknown storage remains writable, independently of merge policy. Matching
+Vulkan memory or overlapping host address ranges catch buffer/image/import
+aliases. Tracking is conservative at allocation granularity. The metadata lasts
+through fence wait **and cache invalidation**, then clears under the backend
+mutex with slot release. Synchronous submissions hold that mutex through their
+fence/cache retirement. Poison wakes admission into `requireLive` without
+inspecting potentially quarantined shadow bytes.
+
+Index inspection now requests a drain only while another live slot may write
+its allocation. The wait predicate rechecks after every wake. A command-owned
+upload ring or ordinary buffer with no pending writer does **not** request an
+index drain. Upload provenance is diagnostic, never permission to ignore a GPU
+writer. `setBytes` marks its command-owned 64 KiB blocks; slices remain immutable
+through completion and reuse still starts only after retirement. An opaque
+`prepare` callback retains its full drain. Noncoherent whole-allocation
+flush/invalidate conflicts retain their existing exclusion. No third slot was
+added: two remain independently resettable and pinned. Baseline slot-only waits
+were zero; whether two slots limit the improved workload is **not yet observed**.
+The existing third-submit test proves admission blocks until a slot retires.
+
+The supplied **8,752,548 bytes/frame** in each of `snapshot_bytes`,
+`shadow_copy_bytes` and `texture_shadow_bytes`, with about **46.74 sampled
+shadow-buffer uses/frame**, describes the no-copy **buffer fallback**:
+`newBufferWithBytesNoCopy` tries host import, then allocates GPU backing when
+unaligned/read-only/COW client pages cannot be imported. Its public `contents`
+remains `_wrapped`; `retainCommandTexture` records the sampled buffer texture's
+offset/row extent, and `prepareCommandShadows` counts that extent once per
+backing buffer. `commit` freezes caller bytes before returning;
+`executeCommitted` previously installed an opaque callback that copied the
+snapshot into shared backing after a full drain. It is not an IOSurface snapshot:
+`importTexture` uses the same IOSurface pages and the existing producer leases.
+`textureRepitchedBytes` is a separate GPU buffer-to-optimal-image pitch fallback
+in `Backend::submit`'s `refresh`, not the CPU snapshot/copy. Its supplied
+**513,947 bytes/frame** is unchanged by this revision.
+
+**No-copy import range (code only, device effect not yet observed).** J163 logged one
+refusal: `Vulkan rc -1000072003 at Backend.hpp:433 (host import)`, i.e.
+`VK_ERROR_INVALID_EXTERNAL_HANDLE` from `AllocateMemory` after the 16 KiB pointer and
+length checks had passed, so that buffer was refused by Turnip/the kernel, not by
+FuxiMetal alignment. The log is one-shot, so the share of unaligned pointers is unknown.
+`importBuffer` now imports the enclosing 16 KiB pages (`HostImportRange.hpp`) and binds the
+`VkBuffer` at the pointer offset (`Buffer::memoryOffset`, folded into linear-texture binds and
+the alignment check), so unaligned or ragged-length CA pointers no longer fail on FuxiMetal's own
+rule; every imported page holds a caller byte. Offsets the buffer cannot bind at are refused.
+The kernel `importHost` logs bounded `FUXI GPU: host import refused stage N ... detail` lines
+(1 args, 2 quota, 3 slots, 4 no VM entry, 5 prepare, 6 length, 7 physical page: detail is the
+offset, 8 kernel mapping, 9 wire alias), and the `no-copy buffer shadowed` line now carries
+`ptr%16K len%16K` and attempts/aligned/enclosed/plan_refused/vulkan_refused counters. A
+read-only/COW page refusal would need a read-only import ABI; not attempted without that
+evidence. No generation-based skip exists for raw pointers, so shadow copies stay for refused imports.
+
+Raw no-copy pointers have no observable CPU mutation generation or IOSurface
+seed. Skipping on object identity, shader-read usage or `didModifyRange` alone
+would miss legal CPU writes. `ShadowCache` instead compares exact bytes at
+commit and shares immutable chunks of at most **4 KiB** with command snapshots.
+Only changed chunks allocate/copy; previous queued versions remain immutable.
+The cache retains at most **4 MiB per fallback buffer** and clears on capacity
+pressure; eviction affects cost only. Completed snapshots release their chunk
+references; queued commands can retain older versions, as with the existing
+unbounded early-submit backlog. Caching applies only to bounded, sampled-only
+buffer textures. General buffer/index access, targets, explicit useResource,
+unknown/full ranges and synchronous commit retain the original packed path.
+Both raw pointer writes and `replaceRegion` through texture views are detected.
+
+Shadow application now supplies explicit snapshot destinations to the backend,
+rather than an opaque callback. Before comparing mapped backing it waits for
+any overlapping GPU writer, including coherent buffers and aliased attachments.
+Snapshot destinations are ordinary mapped fallback buffers; borrowed linear
+images also publish their backing buffer, so their writers expose that range.
+Unchanged cached chunks require no backing write and can overlap prior readers;
+changed chunks wait for overlapping GPU readers/writers before copying. An
+unrelated flight need not retire. Each comparison/application runs under the
+backend mutex; a condition-variable wake rechecks hazards. Comparing the actual
+backing also detects intervening GPU writes or another queue's older version;
+a CPU version match alone never licenses skipping the backing refresh. Packed
+fallback snapshots still copy all their recorded ranges and exclude overlapping
+flights. Event-split commands apply the snapshot once before the first chunk.
+Opaque callers of `prepare` still drain.
+
+The existing aggregate frame-trace line adds:
+
+- `drain_submits`: submit admission calls requesting a drain, including empty
+  or subsequently rejected calls; counted once per call, even across wakes.
+- `drain_reasons=indices-upload,indices-gpu-writable,prepare`: counts of calls
+  encountering each reason. Upload is a subset of GPU-writable and normally
+  zero; reasons may overlap. Upload bytes alone never cause a drain.
+- `drain_reasons` now ends `prepare:N,prepare-conflict:C,prepare-unknown:U`.
+  `prepare` still counts calls carrying a prepare callback. The overlap shadow
+  refresh declares its destinations (`PrepareWrite`: buffer, offset, bytes) and
+  waits only (`prepare-conflict`, also in `wait_reasons` conflict) for busy
+  flights whose all-memory `uses` (coherent included) alias them; it no longer
+  drains. Only an undeclared callback (`prepare-unknown`) still drains. Not yet
+  observed on device.
+- `index_submits=upload,readonly,gpu_writable`: calls containing upload indices,
+  ordinary indices without an observed pending writer, or a pending GPU index
+  writer. Mixed calls can occupy multiple categories.
+- `shadow_waits`: calls encountering a snapshot destination hazard; separate
+  from full-drain, cache-conflict and slot-only reasons. Existing `wait_reasons`
+  counts each reason once per call, including hazards first seen after a wake.
+- `snapshot_reused_bytes/frame`: frozen texture bytes reused without a new CPU
+  snapshot copy; `snapshot_bytes/frame` now counts actual new snapshot payload.
+- `shadow_skipped_bytes/frame`: snapshot payload already equal to GPU backing;
+  `shadow_copy_bytes/frame` counts actual applied payload. `texture_shadow_bytes`
+  retains its logical range meaning, so it need not equal either copy counter.
+
+For unchanged warm sampled inputs, the opportunity is **8.75 MB/frame fewer
+snapshot copies plus 8.75 MB/frame fewer backing copies**, about **17.5 MB/frame**
+of memcpy payload (1.05 GB/s at 60 fps, 2.10 GB/s at 120). Dirty inputs copy only
+changed chunks; first use/cache eviction copies again. Byte comparisons still
+read the ranges and may contend for cache/memory bandwidth; the previous
+snapshot p50 **1.26 ms** is an opportunity, not a promised time saving. Removing
+unnecessary drains permits CPU recording/submission alongside the previous GPU
+flight, but the observed 6–8.7 ms GPU time, surface leases, noncoherent conflicts,
+slot pressure, queue backlog and display pacing still govern 60/120 fps.
+Device qualification must compare new reason/byte counters, slot/admission/
+submit waits, pixels, cadence, latency and GPU execution; no device access or
+new device timing is claimed.
+
+Validation: all **34** `tools/test-fuxi-metal*.py` entrypoints were invoked.
+The **17 runnable scripts passed**: backend, frontend (portable ASan/UBSan models),
+frametrace, shadows (including new real-Vulkan `AdmissionTests`), overlap,
+merge/barriers, memory, mipfeedback, M6, M9m/n/o, metal, metal2, metal2g/h and
+stage with `--policy-storage-only`. Shadows additionally compare cached/bounded/
+full pixels over 25 textures / 125 draws, unchanged repeated frames and CPU
+mutations; admission holds real retirement tickets open to check upload/read-only
+indices, fill/attachment/storage GPU writers, opaque prepare, unchanged/dirty/
+GPU-written shadow backing and unrelated flights. Portable cache tests cover
+4 KiB dirty chunks, frozen queued A/B/A versions, changed extents, eviction,
+backing invalidation and policy fallback. Frame-trace tests check aggregation,
+reset and all added fields. Native encoding/shadow tests add upload provenance,
+view CPU writes, paused submission and reused/dirty snapshot assertions; native
+`.mm` compilation/execution remains **unverified on Linux**. Two-slot exclusion,
+noncoherent conflicts and loss/timeout quarantine still pass. `slot_wait` includes
+admission predicate work as well as sleeps; `shadow_copy` includes the backing
+comparison/application, so skipped bytes do not imply zero CPU time.
+
+The other **17 scripts could not run their suites** because required external
+translator/checkouts, Apple SDK/metallib/cache or boot/artifact inputs are absent:
+artifacts, ca-offline, cache/cache-hits, defaults, draw-plans, M6b, M7,
+M9a/b/g/h/i/k/l, pipeline and translation. Their argument/precondition failures
+are not passes. M9o's optional external shader/line portion and stage's real
+artifact verification are likewise unavailable. Old M9n/o/shadow teardown
+assertions now explicitly trim intentionally pooled memory before checking the
+baseline; the mip-feedback fixture disables draw-plan reuse because its push
+bytes change through an environment variable outside `DrawInput` (production
+planning has no such input). All **12** `tools/sync-fuxi-*.py --check` pass;
+no generated patches changed. No device access, deployment, external project
+changes, vendoring, Apple/GPL code or binaries, push or workflow run occurred.
+
+## Restore simple texture shadows
+
+2026-10-27. The supplied **observed** backboardd trace for `53ddcd8` (149 frames),
+compared with `78aaa3a` (227 frames), validates read-only-index admission:
+`wait_reasons=drain:0` versus `drain:180`, with `index_submits=readonly:149`.
+It rejects byte-compared texture-shadow chunk reuse. Shadow-copy p50/p90 rose
+from **0.634/1.350 ms** to **12.220/118.277 ms**; commit snapshot rose from
+**1.262/1.969 ms** to **3.007/4.341 ms**, with commit-call about **3 ms**.
+Retire-lock rose from **0.001/0.001 ms** to **1.356/104.638 ms**; slot-wait was
+**0.229/53.838 ms**, submit-queue **0.040/102.120 ms**, and backend-submit
+**14.9/122.5 ms** versus **3.6/5.8 ms**. Wall p50 rose from **24 ms** to **75 ms**,
+effective fps fell from **49** to **30**, and one-tick 60 Hz cadence fell from
+**84%** to **44%**. Reusing **3.2 MB/frame** of snapshot bytes and skipping
+**6.9 MB/frame** of backing copies (only **230 bytes/frame** copied, with
+**3.7 MB/frame** of new snapshot bytes) cost more than copying the logical
+**6.9 MB/frame** of texture shadows. These are supplied device observations,
+not a new run or a timing claim for this restoration.
+
+Code attribution in **`53ddcd8`**, with line numbers at that revision:
+
+- `Frontend.mm:1393–1397` calls `ShadowSnapshot::addCached` directly on the
+  caller's commit thread. `ShadowRanges.hpp:93–101` (`ShadowCache::capture`)
+  locks the per-buffer cache mutex for each chunk, does a `std::map` lookup and
+  full-byte `memcmp`, and allocates a vector/shared ownership for changed
+  chunks. `addCached` at lines 118–121 also appends a reference for every chunk,
+  even on unchanged frames. This work precedes commit return; it does not hold
+  the backend mutex.
+- `Backend.hpp:893` acquires `Backend::mutex` before admission; lines 895–899
+  also collect/deduplicate all resource uses under it. `shadowHazard`
+  at lines 908–912 scans each snapshot segment/chunk against live-slot writer
+  and use lists. After excluding writers, it calls `eachDirty`
+  (`ShadowRanges.hpp:127`) to compare mapped backing bytes, then checks dirty
+  ranges against overlapping GPU readers. The condition-variable predicate at
+  `Backend.hpp:918–923` repeats this work on wakes while holding that mutex.
+  The actual condition-variable sleep releases the mutex; the comparisons and
+  nested range scans do not. `slot_wait` includes predicate CPU work.
+- `Backend.hpp:934` applies snapshots under the same backend mutex.
+  `ShadowSnapshot::apply` (`ShadowRanges.hpp:138–142`) compares cached backing
+  bytes again before copying and releases chunk references, potentially freeing
+  older queued versions there. `shadow_copy` includes that work, even with
+  almost no copied payload. The retirement callback waits for the fence outside
+  the mutex, then takes it at `Backend.hpp:1572–1573` before invalidation,
+  resource release and slot wakeup. Thus admission/application can delay
+  retirement despite a completed fence. The submit queue is serial
+  (`Frontend.mm:1750–1751` in that revision), so a slow submit also delays later
+  commands. The trace fits this contention mechanism; it does not isolate the
+  cost of each individual compare, allocation or scan.
+
+Restore the `78aaa3a` shadow implementation: one command-owned packed snapshot
+of recorded ranges before commit returns, then unconditional `memcpy` of those
+ranges into shared backing. The existing two-entry `ShadowPool` still reuses
+retired packed storage. Remove `ShadowCache`, immutable chunk maps/references,
+backing comparisons, explicit shadow-destination admission and its all-use
+metadata. Overlap mode again installs the original opaque `prepare` callback,
+which fully drains before writing shared backing under the backend mutex;
+event-split commands apply it once. The synchronous refresh and bounded/full
+range rules are restored too. Raw caller pointers have no reliable generation
+or mutation seed, so identity alone cannot safely skip their copies.
+
+Keep the `53ddcd8` index-writer tracking, coherent/import/attachment alias checks,
+final-plan storage-writer proof, upload provenance, read-only-index admission,
+noncoherent exclusion, poison handling and all index/drain counters unchanged.
+Only the reader-use metadata needed by removed shadow admission is dropped;
+GPU-writer metadata remains through fence wait and invalidation. A shadow copy
+can once again increment `prepare`/drain counters; an otherwise read-only index
+does not cause a drain. Keep every frame-trace field and its aggregation/reset:
+`snapshot_reused_bytes`, `shadow_skipped_bytes` and `shadow_waits` now read zero;
+`snapshot_bytes` and `shadow_copy_bytes` again count all recorded payload.
+
+Portable controls now assert full copies for unchanged inputs, frozen queued
+A/B/A versions, overwriting intervening GPU writes, bounded/full/fallback pixels,
+and prepare exclusion even for unrelated flights. The real-Vulkan admission
+controls retain the upload/read-only and GPU-written index checks. Native
+`ShadowFrontendTests.mm` keeps view writes and paused queued snapshots, expecting
+all 142 bytes captured/applied on every commit and zero reuse/skip counters.
+Its submit calls and the modeled backend match the restored four-argument API;
+native `.mm` compilation/execution remains unavailable on Linux and was checked
+by inspection.
+
+Validation: invoked all **34** `tools/test-fuxi-metal*.py` entrypoints. All
+**17 runnable suites passed**: backend, frontend, frametrace, shadows (including
+real-Vulkan admission and synchronous/overlap pixels), overlap, merge/barriers,
+memory, mipfeedback, M6, M9m/n/o, metal, metal2, metal2g/h, and stage with
+`--policy-storage-only`. Existing local shader tools enabled the Vulkan controls;
+no dependencies were downloaded. The other **17** require unavailable external
+translator/checkouts, Apple SDK/metallib/cache or boot/artifact inputs:
+artifacts, ca-offline, cache/cache-hits, defaults, draw-plans, M6b, M7,
+M9a/b/g/h/i/k/l, pipeline and translation. Their argument/precondition failures
+are not passes. M9o's optional external shader/line controls and stage's real
+artifact verification remain unavailable. All **12**
+`tools/sync-fuxi-*.py --check` pass; `git diff --check` passes and generated
+patches are unchanged. Frame-trace definitions/tests are unchanged from
+`53ddcd8`. No device access or new device measurement, external project changes,
+vendoring, Apple/GPL code or binaries, push or workflow run occurred.
+
+
+## 3D sampled textures (backboardd GPU-gate latch, boot K164)
+
+OBSERVED (K164): backboardd requested `type=7 format=70 size=16x16x16 mips=1
+usage=0x1` (MTLTextureType3D, RGBA8Unorm, ShaderRead; probably a CoreAnimation
+colour lookup table), FuxiMetal refused it on `textureType` and the refusal
+latched the GPU gate (`next-respawn=CPU`). The swizzle in that descriptor was the
+identity (2,3,4,5) and was never the cause.
+
+Change (host-tested on lavapipe, device effect not yet observed):
+- `newTextureWithDescriptor` accepts `MTLTextureType3D` when ShaderRead only
+  (no RenderTarget), one mip, one array slice, one sample, depth within the 2D
+  device limit and `ResourceLimits::volume`. `textureShapeAccepted` gained
+  depth/levels arguments; `allocateTexture` gained a trailing `depth`.
+- Backend: `VK_IMAGE_TYPE_3D` images with depth extent, `VK_IMAGE_VIEW_TYPE_3D`
+  sampled views (`viewTypeFor`/`imageTypeFor`, also used by the descriptor path;
+  the translator-reflected `texture_type` 7 already matches `Texture::textureType`),
+  `depth` in `TextureLevels` (`levelDepth`). Sampler address mode W was already
+  mapped from `rAddressMode`. The component swizzle path is unchanged.
+- Transfers: `Operation` gained `srcZ/dstZ/depth/imageBytes` (0 = whole level
+  depth / tightly packed rows). `replaceRegion`/`getBytes` (z origin, depth,
+  bytesPerImage), buffer<->texture and texture<->texture blits carry slices;
+  Vulkan `bufferImageHeight = bytesPerImage / bytesPerRow`; alias snapshots cover
+  all slices. A 2D transfer still requires depth 1, z 0 and no image stride.
+- Still refused cleanly: 3D render targets/clears, 3D with mips or
+  `generateMipmaps`, linear (buffer-backed) 3D, IOSurface 3D, array/cube/MSAA,
+  2D<->3D copies, depth slices on 1D/2D textures, out-of-range z/depth,
+  `bytesPerImage` not a multiple of `bytesPerRow`.
+- Tests: `tools/test-fuxi-metal-m9p.py` (16x16x16 RGBA8 upload/readback tight and
+  padded, partial box, overlapping z copy, refusals; sampling a 3D texture in a
+  draw needs the external translator and was not run), plus a 3D block in
+  `BlitFrontendTests.mm` (compiles only on macOS; checked by inspection).
+- New log fields: none. Expected device evidence: no `texture reject
+  textureType 7` line and no `gate runtime-failure`; not yet observed.
+
+## AdrenoMetal port review (surface import reuse, refusing render encoder)
+
+Source: AdrenoMetal (MIT), `NativeBridgeMetalFrontend.mm` (`surfaceBuffer`, `encoder:handle:what:`) and
+`bridge/patches/0008..0016`. The source's git history was not readable from this lane; the current tree was compared.
+
+- Present import reuse (ported in spirit, device effect not yet observed): `Backend::importTexture` takes the IOSurface ID
+  as `identity`; a live import with the same (id, base, bytes, row, offset, w, h) is shared by reference count instead of a new
+  `vkAllocateMemory` + `vkMapMemory` + image/view per CA wrap. The cache holds no reference, so an entry dies with its last wrapper
+  or pending command; a new mapping, size or layout misses. New log fields on `backboardd frames=`: `surface_import_hits`,
+  `surface_import_misses`. Test: `MemoryReuseTests.cpp` (lavapipe host import).
+- Refusing render encoder (ported, device effect not yet observed): every refused `renderCommandEncoderWithDescriptor:` returns a
+  `FuxiRefusedRender` that forwards all selectors to `rejectSelector:` (command buffer stays rejected and errors on commit), instead
+  of nil. RenderBox caches encoder IMPs with `methodForSelector:`, which is NULL for nil. Census mode still returns nil.
+- Not ported, padded-row aliasing (0008) and tile-store bound (0016): they edit the metal2vulkan Rust runtime. FuxiMetal's own
+  `linearTexture` only aliases when Vulkan's linear pitch equals Metal's and otherwise falls back to a shadow copy (J163 shows A8
+  masks at row 256/512/768 against Turnip 64-byte pitches). A wider image over the padded row would need the sampled coordinates
+  scaled by width/pitch in the translated shader, which this lane cannot do; written-texture aliasing is not reachable (the fallback
+  only exists for sampled-only textures). Candidate for the translator/build-patch lane.
+- Not ported, 0009..0015: all metal2vulkan runtime/bind/canon changes with no FuxiMetal equivalent.
+- Not ported, frame/wait trace: FrameTrace already records `waitUntilCompleted`/`waitUntilScheduled` durations per frame; their
+  addition is the caller return address, judged too little to add.
+## GPU map/unmap cost, ranged TLBI and IO-coherent imports (not yet observed on device)
+
+Ported from UniXNU `ArmSmmu4K` and `Adreno740` (MIT; newest work compared by reading the source files, git history of the
+sources was not readable). Sources reviewed: `ArmSmmu4KLive.c` (`ArmSmmu4KSyncContextTlbPages`, `ArmSmmu4KTlbPageLimit=512`,
+the `aliases=0`/exclusive map path), `ArmSmmu4KProgram.c` (TLBIVAL +0x620, AArch64 format VA[55:12] | ASID<<48, TLBSYNC +0x7f0),
+UniXNU docs `drivers/arm-smmu4k.md` and `drivers/adreno740.md` ("Memory and TLB" table). Our client root is a flat 4K table with
+no per-range alias classes, so the port is the same idea in our shape:
+
+- **Overlap test without the NC read-back** (`fuxi_gpu_abi_backend.inc`): map pass 1 used to read every target leaf from NC
+  table memory. `fg_abi_used[]` is a cached 48 KiB bit-per-4K mirror written only by map, unmap and init; pass 1 reads that.
+  Refusal is still exact to 4K and publishes nothing. Pass 1 also no longer resolves the leaf table pointer per 2 MiB.
+- **Segment lookup per run in BoImport** (`FuxiAdrenoUserClient.cpp` `importHost`): one `getPhysicalSegment` per physical run;
+  the pmap cache-class predicate (`fuxi_adreno_host_page_ok`) still runs for every 16K page. Refusal stage 7 now reports the
+  offset of the failing page.
+- **Ranged TLBI on unmap, boot-arg `fuxigpuncimport` value 128, default off**: up to 512 4K pages are invalidated with one
+  64-bit TLBIVAL each plus TLBSYNC and the same status poll as `g4_tlb`; larger unmaps, and every unmap without the bit, keep
+  the whole-ASID invalidate. A failed write or sync is a fault (`client unmap TLB sync`), never a skip. It needs a 64-bit store
+  to the SMMU context bank (`g3_sw64`, via the existing wide `fg_access`), unverified on this SMMU: hence opt-in. Note
+  `fg_abi_switch` still does a full ASID invalidate on every root switch (submit and retire); UniXNU does none at submit. That
+  needs a separate ASID for the client root and is not done here.
+- **IO-coherent imports, value 64, default off**: at the first `BoMap` of an import the kernel runs a fail-closed self-test.
+  A cacheable kernel page is mapped with the import leaf attributes (Normal NC, outer-shareable), the CPU leaves 8 lines
+  dirty and caches 8 others, and one IB makes the GPU copy the 8 dirty lines to an NC result page (`CP_MEM_TO_MEM`) and
+  overwrite the 8 cached lines (`CP_MEM_WRITE`). Only 16/16 matches set the verdict "coherent"; then submit stops cleaning
+  imports, retirement stops invalidating them and the map-time clean (value 1) is skipped, the avoided bytes count in `skipped`.
+  Stale lines, partial matches, a map failure inside the probe window, a fault or a 100 ms hang leave the existing
+  clean/invalidate path (a hang or fault also poisons the GPU like any client fault). Busy results retry, three times at most.
+  The probe uses 4 KiB of NC scratch after the ABI page tables, the last 64 KiB of the client aperture and a 16 KiB kernel BSS
+  page; it unmaps them and cleans the page afterwards. Scope of the proof: the kernel page and the import pages share the CPU
+  attribute class and the leaf bits; a PASS on a few lines at boot cannot prove every later line, which is why it is opt-in.
+  Expected device evidence: `FUXI GPU ABI: coherent-import self-test pass cpu_to_gpu 8/8 gpu_to_cpu 8/8 -> skip ...` or
+  `stale ...` (the expected result on a non-snooping path), then `cleaned`/`skipped` deltas in the presents line.
+- `fuxigpuncimport` is a bitmask now: 1 NC-import (unchanged), 64 coherency self-test, 128 ranged TLBI. Values 2..32 are
+  deliberately unused so concurrent lanes can claim them; other values of those bits were not meaningful before.
+  (Since claimed: 2 fenced WPTR, 4 stall recovery, 8/16/32 frame log, copy priority, superseded skip; see gpu-scanout.md.)
+  Bit 25 (value 33554432) is not a GPU option: it runs the kernel PAC self-test (patch 0114, [arm64e.md](arm64e.md)).
+  Bit 27 (value 134217728, needs 16) parks the job copy priority would refuse instead of refusing it (gpu-scanout.md).
+- Tests: `tools/test-fuxi-metal.py` (overlap mirror, TLBIVAL values/limit/fallback/fault, self-test pass/stale/partial/hang/
+  fault/busy/occupied, bitmask parse), `tools/test-fuxi-hostimport.py` (segment lookups, per-page predicate in a long run).
+- New log field: the self-test line above. Owned BO maps still need one pmap lookup per 16K page (scattered BOs); a contiguous
+  BO could skip it but the backend does not know contiguity, not changed.
+
+**Submit waits and shadow rename (O168 analysis; device effect not yet observed).**
+`lease_back` in the frame trace is `Backend::submit` entry to slot acquisition (backend
+mutex plus the slot/conflict wait), not a display or IOSurface lease; `lease_lock` is
+`lease_front` (the IOSurface locks, about 0.03 ms) plus `lease_back`, which is why it
+equals `slot_wait`. `wait_reasons conflict` and `drain_reasons prepare-conflict` mean a
+declared shadow prepare (`ShadowSnapshot::apply`, which memcpys changed ranges into a
+backend buffer) overlaps memory used by an in-flight slot, so the submit waits for that
+flight's fence (GPU retirement). `conflict_kinds=buffer,shadow,texture,surface,index`
+counts submits that waited per resource kind; `display_lease_wait_ms/frame` is the only
+display-side wait. `fuxigpurename=1` (opt-in; requires overlap) renames the backing
+buffer of a read-only shadow texture (never bound directly, tracked by
+`Buffer::directUse`) to a spare storage of equal size: the current bytes are copied
+there, the write goes to the new storage, and the flight keeps reading the old one. The
+snapshot key is `Buffer::shadowKey()` so queued snapshots follow the swap. New fields:
+`shadow_renames/frame`, `shadow_rename_bytes/frame`.
+
+**Why the first rename never engaged (P169; fix not yet observed).** `conflict_kinds`
+reported shadow and texture together at the same count because the busy use was one
+linear alias texture: `linearTexture` binds an image directly to the shadowed buffer's
+memory (it adds the `texture` use for the mapped range and the `shadow` use for its
+`backingBuffer`). Such a buffer is sampled in place, so its storage cannot be swapped
+under the bound image, and `Buffer::aliased` now declines it. With rename enabled,
+`FuxiBuffer`'s sample-only linear textures over a shadowed buffer take the shadow-copy
+path (`shadowed` argument), after which the buffer is a plain shadow backing and
+renameable. The policy init logs `FUXI MTL: policy shadow_rename=N source=boot|env|none`,
+and `rename_declined=off,not_backing,direct_use,texture,budget,other` counts conflicting
+writes that could not be renamed.

@@ -2,7 +2,7 @@
 """Generate/check GPU-SCANOUT's surface/console overlay after preceding patches.
 
 The GPU implementation is carried by sync-fuxi-metal.py; framebuffer integration
-by sync-fuxi-unixnu.py. This overlay owns the final SweetSurface snapshot and
+by sync-fuxi-unixnu.py. This overlay owns the final SweetSurface source/header snapshots and
 only the existing display-kick function in pe_serial (no unrelated console code).
 """
 import argparse
@@ -54,10 +54,12 @@ def main():
     surface = 'iokit/Kernel/arm/SweetSurface.cpp'
     console = 'pexpert/arm/pe_serial.c'
     sync.PATCH = PATCH
-    sync.FILES = {surface: 'SweetSurface.cpp'}
+    header = 'iokit/Kernel/arm/SweetSurface.h'
+    sync.FILES = {surface: 'SweetSurface.cpp', header: 'SweetSurface.h'}
     before = sync.baseline()
     before[console] = KICK_BEFORE
     after = {surface: (ROOT / 'xnu/fuxi-scanout/SweetSurface.cpp').read_text(),
+             header: (ROOT / 'xnu/fuxi-scanout/SweetSurface.h').read_text(),
              console: (ROOT / 'xnu/fuxi-scanout/display-kick.c').read_text()}
     expected = ''.join(shift(''.join(difflib.unified_diff(before[name].splitlines(True),
         after[name].splitlines(True), fromfile='a/' + name, tofile='b/' + name)),

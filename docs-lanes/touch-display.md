@@ -87,8 +87,8 @@ Guesses (not measured):
 - **Cropped edges.** The centered crop hides 22 px left/right and 18 px top/bottom of iOS
   (the bottom of the home indicator). A scaled present would show all of it, but each
   pixel would cost more CPU and look softer.
-- SweetHIDTouch sends one collection per changed finger. Two fingers moving give two HID
-  events per poll; one combined event would be cleaner (SweetHID.cpp, not changed here).
+- SweetHIDTouch originally sent one collection per changed finger. The opt-in
+  report collection path below addresses this in the canonical H1 overlay.
 
 ## Artifacts (local, not in git)
 
@@ -128,3 +128,146 @@ On the phone (user):
 
 Failure signs: `FUXI TOUCH: FIFO read error`, `GPI re-init`, `controller reset
 event`, or a panic in AppleCLCD::vsyncFired / present. Fall back to the 0091d image.
+
+
+## UniXNU NativeHidInput report fixes (2026-10-24)
+
+Source: **UniXNU / [NativeHidInput](https://github.com/UniXNU/NativeHidInput)**,
+`NativeHidInput.cpp`, audited from `28f9b46` through
+[`ba03e5d147452b2166aab7435d219fa10877672b`](https://github.com/UniXNU/NativeHidInput/commit/ba03e5d147452b2166aab7435d219fa10877672b),
+**BSD-2-Clause-Patent**, copyright 2026 NativeHidInput contributors.
+The full notice is retained in `xnu/fuxi-h1/LICENSE.NativeHidInput` and installed
+beside SweetHID by patch **0103-fuxi-kernel-h1.patch**. The supplied upstream
+files and log were read only; no upstream code was executed or built.
+
+Our canonical touch sources are `xnu/fuxi-h1/fuxi_touch.c` and
+`xnu/fuxi-h1/SweetHID.cpp`: 0091 introduces FTS SPI/GPI, 0093 improves polling,
+0097 adds input boost, and 0103 applies the current H1 sources. Patch 0058
+provides the iOS 16.7 IOHIDEvent and event-service/user-client implementation.
+SweetHID constructs events directly and queues them to backboardd; it does
+not use UniXNU's IOHIDDevice descriptor or original IOHIDEventDriver parser.
+
+| Upstream commit | Fuxi adaptation / disposition |
+| --- | --- |
+| `75efe1c5ee32b2da3ef8dc978adbdc683eef11a8` — lift by identifier | Already correct: FTS IDs index the active bitmap and coordinate arrays, not packed report slots. Retained and tested. The batch path compares the complete new bitmap to SweetHID's previous ID state and emits every vanished ID at its last reported position, even when the down count stays constant. |
+| `e43c2541133e25bdb48df564a4283888b64cc231` — multi/lift counters | Adapted to the existing per-contact FUXI TOUCH summary, available with either dispatch mode. |
+| `22f2dd454e8742f0639a737065f59ab42927a165` — confident fingers | The descriptor change does not apply. Both SweetHID paths explicitly use `kIOHIDDigitizerTransducerTypeFinger` for every child, including lifts. There is no Touch Valid/confidence event field in our 1915 API and no parser to reinterpret a missing descriptor bit as a palm. The root remains a Hand collection, as before; it is not a palm child. No guessed confidence flag is added. |
+| `ba03e5d147452b2166aab7435d219fa10877672b` — one report collection | Adapted behind `fuxitbatch=1`: pass the full report from FTS to SweetHID once, then build one collection containing active IDs and disappeared-ID lifts with a common timestamp. `DigitizerCollectionDispatch` itself is unnecessary without IOHIDEventDriver. |
+
+**Boot argument:** `fuxitbatch=1` enables report batching (12 bytes, or 13 with
+a separating space). Absent/zero retains the old per-finger path. It uses
+`PE_parse_boot_argn`, like the existing Fuxi options, and logs
+`FUXI TOUCH: report collections enabled (fuxitbatch=1)` once when enabled.
+No existing command line is lengthened automatically.
+
+Every changed batch includes stationary held fingers, new/moving fingers and
+lifts together, with at most ten children indexed by hardware ID. Identity,
+range/touch/position masks and the lifetime edge flag remain per finger.
+Coordinates keep the native or centered-crop mapping and panel clamps. The
+root position is the mean of active fingers (or lifted fingers on final up),
+with aggregate range, touch, button and event masks. Unchanged reports are
+still suppressed. If collection/child allocation or append fails, no partial
+set is dispatched and SweetHID state stays unchanged. A pending flag retries
+the latest set at the end of normal polling iterations, including all-up when
+the FIFO is empty. New input supersedes the pending set; no old down is replayed
+after its lift. Retries do not increment the producer counters, spin, or change
+polling periods. This acknowledges local event construction/dispatch only,
+not backboardd queue delivery. There is no new allocation retry queue.
+
+The previous Fuxi path already includes held fingers in each collection, so
+UniXNU's claim that its old path could never pinch does **not** establish the
+same failure here. Batching removes intermediate mixtures of old/new finger
+positions and redundant collection dispatches. It is a correctness and event
+coherence improvement to test, not a measured fix for rendering stalls.
+
+The FTS FIFO is a stream of enter/motion/leave deltas, not a complete hardware
+contact snapshot. Absence from one FIFO drain cannot mean a lift: a stationary
+finger may have no event. No speculative timeout or missing-FIFO-ID lift is
+added. Existing hover-as-up, explicit leaves, display-off releases, reset
+releases, FIFO-error releases, wake-touch suppression and polling stay in
+place. No new HackiOS change is needed for this NativeHidInput comparison;
+H1's existing MIT tap-to-wake policy remains in use.
+
+The summary now ends with `, multi M max P lifts L`:
+
+- `multi`: report masks with at least two fingers down during this contact.
+- `max`: greatest number down in a report during this contact.
+- `lifts`: ID bits changing from down to up, including existing forced releases.
+
+A contact runs from first down to last up, and these counters reset on the next
+first down. These count producer reports/lifts offered to HID, not successful
+queue delivery or UIKit acknowledgements. Existing `reports` can exceed actual
+events because SweetHID suppresses unchanged positions. No per-motion log is
+added. The lift counter does not distinguish ordinary leaves from recovery.
+
+### Supplied boot-use95 log audit
+
+Observed: 16 transitions (eight downs, eight matching ups), all ID 0; eight
+completed contact summaries totaling 510 reports and 1,051 polls. Three
+contacts began at an edge and retained the edge suffix on up. There are no
+duplicate downs, unmatched ups or contacts left down at the end of the log.
+There are no FIFO read errors, GPI re-initializations, controller resets or
+touch-driver stops. Controller startup reports `reset err=0`, ready `03`,
+chip ID `3640`, sensing and asserted IRQ.
+
+Contact summaries show 6,002–8,889 us mean report spacing; substantial drags
+are around 8.3–8.9 ms (roughly 120 Hz). FIFO read averages are 167–205 us, with
+a largest reported maximum of 454 us. This is evidence of promptly consumed
+single-finger input, not proof of touch-to-display latency. No palm type or
+confidence payload is logged. There are no multi-finger contacts in this
+capture, so it cannot establish pinch behavior, palm classification or prove
+that every controller lift reached UIKit. It provides no evidence of a stuck
+contact or dropped lift, and does not identify touch as the cause of lag.
+
+### Host verification and hardware follow-up
+
+```sh
+python3 tools/sync-fuxi-h1.py
+python3 tools/sync-fuxi-h1.py --check
+python3 tools/test-fuxi-touch.py
+python3 tools/test-fuxi-h1.py
+```
+
+The new host test compiles the actual `ft_poll`, `ft_report`, legacy `touch`,
+batched `report` and C HID entry points under ASan/UBSan. SPI, allocation,
+locking and event dispatch are stand-ins. It covers both dispatch modes,
+simultaneous movement, low-ID removal with a high-ID survivor, same-count ID
+replacement, all ten fingers and simultaneous lifts, last-position lifts,
+aggregate/child masks and timestamps, Finger type on downs and ups, native and
+cropped coordinates, clamps, lifetime edge flags, unchanged reports,
+allocation/append failures and final-up retry, invalid/hover/leave FIFO events, two-read failures
+and tap-to-wake suppression, plus 2,000 randomized contact sets. An empty FIFO
+is tested to retain stationary fingers. The sync check replays every earlier relevant
+patch with `git apply`, checks the canonical snapshot and verifies 0103 applies.
+
+Both complete modified translation units also passed an arm64 Mach-O syntax
+check against saved XNU 8796 kernel headers and component flags, with
+`-mgeneral-regs-only -Werror`. As in the existing UniXNU host check, Apple-only
+allocation-type builtins use syntax-check stand-ins and existing allocation
+macro initializer warnings are suppressed. Only our production sources are
+compiled; no scripts from the saved build tree are executed. Reproduce with:
+
+```sh
+python3 tools/test-fuxi-touch.py --xnu-buildtree "$XNU_BUILDTREE"
+```
+
+Regression results: **50 Linux host scripts/checks passed**, including the new
+touch test, H1, UniXNU, perf, scheduler, idle, backlight, GPU/scanout/Metal,
+system, Wi-Fi and WLAN suites. The existing M9i test was compile-only; backend,
+M6, Vulkan, M9m/M9n/M9o and frame-trace controls used the system software ICD.
+The staging test's `--policy-storage-only` checks also passed. Its full default
+invocation requires the missing built `tools/out/FuxiMetal.bundle/Info.plist`;
+the same missing-artifact failure was reproduced using the starting commit's
+staging/test sources. No passing test regressed. Twenty-one other scripts
+requiring external translator/Mesa/NativeMetal inputs, signed artifacts or
+kernel/boot outputs were not run. No dependency source was modified.
+
+No phone operation, kernel link or hardware test was performed. Before enabling
+by default, compare identical boots with the argument absent and enabled:
+exercise two-finger pinch and independent lifts in both ID orders, replace a
+finger while another is held, move both fingers, try ten contacts, home-edge
+swipes, lock with fingers held, and tap-to-wake. Expect balanced per-ID down/up
+logs, `max` matching the held count, `multi` advancing and no stuck UIKit
+contacts or lost edge gestures. Confirm on-device serialized event acceptance
+and gesture behavior; host event stand-ins cannot establish either. Keep the
+option off if it regresses. UI smoothness needs a separate frame-time A/B.

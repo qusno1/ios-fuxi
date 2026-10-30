@@ -161,6 +161,50 @@ def add_product_children(root, haptics=False, camera=False, d22ap=mkadt.D22AP_AD
     return root
 
 
+def set_display_gamut(root, gamut):
+    """/product artwork-display-gamut. The D22AP value P3 makes MobileGestalt report
+    deep colour (MTSupportsDeepColor), so MaterialKit snapshots idle materials into
+    two-plane 10-bit b3a8 IOSurfaces that the Fuxi GPU path cannot render (black
+    App Library). The Fuxi scanout is 8-bit BGRA, so sRGB is the honest answer."""
+    product = next((n for n in root.children if n.name == 'product'), None)
+    if product is None:
+        raise ValueError('--display-gamut needs a /product node')
+    value = mkadt.cstr(gamut)
+    if product.prop('artwork-display-gamut') is None:
+        product.props.append(('artwork-display-gamut', 0, value))
+    else:
+        setprop(product, 'artwork-display-gamut', value)
+    return root
+
+
+def set_display_options(root, refresh_mhz=0, swap_hist=False):
+    """Opt-in /arm-io/disp0 properties read by SweetFramebuffer (none by default):
+    fuxi,refresh-mhz publishes displayMinRefreshInterval at that rate (with fuxipanel120=1),
+    fuxi,swap-hist=1 logs SwapEnd intervals in vsync periods. Replaces existing values."""
+    if refresh_mhz and not 61000 <= refresh_mhz <= 240000:
+        raise ValueError('--refresh-mhz must be 61000..240000')
+    wanted = ([('fuxi,refresh-mhz', struct.pack('<I', refresh_mhz))] if refresh_mhz else []) + \
+        ([('fuxi,swap-hist', struct.pack('<I', 1))] if swap_hist else [])
+    if not wanted:
+        return root
+    arm_io = next(c for c in root.children if c.name == 'arm-io')
+    disp0 = next(c for c in arm_io.children if c.name == 'disp0')
+    names = {k for k, _ in wanted}
+    disp0.props = [p for p in disp0.props if p[0] not in names] + [(k, 0, v) for k, v in wanted]
+    return root
+
+
+def ensure_mac_addresses(root):
+    """Add mkadt's synthetic /chosen Wi-Fi and Bluetooth MACs if missing, so
+    older --template ADTs get them too (MobileGestalt UniqueDeviceID inputs)."""
+    chosen = next(n for n in root.children if n.name == 'chosen')
+    for name, value in (('mac-address-wifi0', mkadt.SWEET_WIFI_MAC),
+                        ('mac-address-bluetooth0', mkadt.SWEET_BT_MAC)):
+        if chosen.prop(name) is None:
+            chosen.props.append((name, 0, value))
+    return root
+
+
 def reserve_gpu(root, mem_size=MEM_SIZE):
     """Preserve an integration ADT's identity/root extents while excluding scratch."""
     chosen = next(n for n in root.children if n.name == 'chosen')
@@ -186,6 +230,9 @@ def main():
     ap.add_argument('--ram-layout', choices=('full', '1g'), default='full', help='full = 5088 MiB; 1g = original 1 GiB XNU window')
     ap.add_argument('--product-haptics', action='store_true', help='add /product/haptics copied from the D22AP tree')
     ap.add_argument('--product-camera', action='store_true', help='add an empty /product/camera node (no flash)')
+    ap.add_argument('--display-gamut', choices=('P3', 'sRGB'), help='set /product artwork-display-gamut (sRGB: no deep colour surfaces)')
+    ap.add_argument('--refresh-mhz', type=int, default=0, help='disp0 fuxi,refresh-mhz: CA refresh interval at this rate (e.g. 120800 = measured TE); needs fuxipanel120=1')
+    ap.add_argument('--swap-hist', action='store_true', help='disp0 fuxi,swap-hist=1: log SwapEnd interval histogram per SWEET FB stats window')
     ap.add_argument('--d22ap-adt', type=Path, default=Path(mkadt.D22AP_ADT), help='real D22AP device tree (not in git)')
     ap.add_argument('--board', choices=('fuxi', 'vermeer'), default='fuxi',
                     help='vermeer = Redmi K70 / POCO F6 Pro (SM8550); requires the measured geometry overrides')
@@ -224,9 +271,13 @@ def main():
                 raise ValueError('--template requires --gpu-reserve and preserves existing root extents')
             root, _ = adt.parse(args.template.read_bytes())
             root = reserve_gpu(root, mem_size)
+            root = ensure_mac_addresses(root)
         else:
             root = build(args.ufs_readonly, root_props, args.smp, args.gpu_reserve, mem_size)
         root = add_product_children(root, args.product_haptics, args.product_camera, args.d22ap_adt)
+        if args.display_gamut:
+            root = set_display_gamut(root, args.display_gamut)
+        root = set_display_options(root, args.refresh_mhz, args.swap_hist)
         has_ufs = any(n.name == 'fuxi-ufs' for n in root.children)
         validate_live(args.live_fdt, has_ufs)
         blob = adt.serialize(root)

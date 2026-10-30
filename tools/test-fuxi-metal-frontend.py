@@ -18,11 +18,23 @@ def main():
     with tempfile.TemporaryDirectory() as tmp:
         d=Path(tmp);conf=d/'smoke.conf'
         compiler=['xcrun','clang++'] if os.uname().sysname=='Darwin' else ['clang++']
-        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests'):
+        for name in ('ClientGateTests','BackboardGateTests','TextureLevelsTests','MipAccessTests','SurveyTests','ClientSetupTests','NativeSelectionTests','SurfaceLeaseTests','TranslationPolicyTests','CompileBoostTests','FrameTraceTests','FrameCPUTests','OperationAPITests','FrontendEncodingTests','TransientMemoryTests','SlabMemoryTests','DrawPlanTests','DrawPlanCacheTests','ShadowRangesTests','PrewarmStoreTests','SpirvRelaxTests','SpirvLoopsTests','OcclusionProofTests'):
             subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror','-pthread',
                             '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal'/(name+'.cpp')),
                             '-o',str(d/name)],check=True)
             if not a.compile_only:subprocess.run([str(d/name)],check=True,timeout=15)
+            if not a.compile_only and name == 'FrameTraceTests':
+                subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'TranslationPolicyTests':
+                for args,env,want in (('',None,'0'),('','1','1'),('','0','0'),('fuxigpurename=1',None,'1'),('fuxigpurename=0','1','0')):
+                    e=dict(os.environ,FUXI_MTL_TEST_BOOTARGS=args);e.pop('FUXI_MTL_SHADOW_RENAME',None)
+                    if env is not None:e['FUXI_MTL_SHADOW_RENAME']=env
+                    subprocess.run([str(d/name),'rename',want],env=e,check=True,timeout=15)
+            if not a.compile_only and name == 'FrameTraceTests':
+                subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1'),check=True,timeout=15)
+            if not a.compile_only and name == 'FrameCPUTests':
+                for level in ('1', '2'):
+                    subprocess.run([str(d/name)],env=dict(os.environ,FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace='+level),check=True,timeout=15)
             if not a.compile_only and name == 'TranslationPolicyTests':
                 keys = ('fuxigpustages', 'fuxigputrace', 'fuxigpuasync')
                 enabled = dict(os.environ, FUXI_MTL_STAGE_CACHE='1', FUXI_MTL_TRANSLATION_TRACE='1', FUXI_MTL_ASYNC_PIPELINES='1', FUXI_MTL_COMPILE_BOOST='1')
@@ -51,6 +63,10 @@ def main():
                         '-o',str(d/'timeline')],check=True)
         if not a.compile_only:subprocess.run([str(d/'timeline')],check=True,timeout=15)
         subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
+                        '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/HostImportRangeTests.cpp'),
+                        '-o',str(d/'host-import-range')],check=True)
+        if not a.compile_only:subprocess.run([str(d/'host-import-range')],check=True,timeout=15)
+        subprocess.run([*compiler,'-std=c++17','-Wall','-Wextra','-Werror',
                         '-fsanitize=address,undefined',str(ROOT/'tools/fuxi-metal/ResourceCacheTests.cpp'),
                         '-o',str(d/'resource-cache')],check=True)
         if not a.compile_only:subprocess.run([str(d/'resource-cache')],check=True,timeout=30)
@@ -61,10 +77,16 @@ def main():
         frameworks=['-framework','Foundation','-framework','Metal','-framework','IOSurface']
         def call(command):subprocess.run(command,check=True)
         if a.compile_only:
-            for name in ['AsyncPipelineFrontendTests','ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests','ScanoutFrontendTests']:
+            for name in ['EncodingFrontendTests','ShadowFrontendTests','OverlapFrontendTests','AsyncPipelineFrontendTests','ConstantFrontendTests','FrontendTests','PipelineFrontendTests','CAFrontendTests','MipFrontendTests','MRTFrontendTests','GateFrontendTests','CensusTests','RenderServerFrontendTests','BlitFrontendTests','LinearFrontendTests','ScanoutFrontendTests']:
                 call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal'/(name+'.mm')),*frameworks,'-o',str(d/name)])
             print('PASS: compile-only frontend tests; no test executables run')
             return
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/EncodingFrontendTests.mm'),*frameworks,'-o',str(d/'encoding')])
+        subprocess.run([str(d/'encoding')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=30)
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ShadowFrontendTests.mm'),*frameworks,'-o',str(d/'shadows')])
+        subprocess.run([str(d/'shadows')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1 fuxigpuframetrace=1'),check=True,timeout=30)
+        call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/OverlapFrontendTests.mm'),*frameworks,'-o',str(d/'overlap')])
+        subprocess.run([str(d/'overlap')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='fuxigpuoverlap=1 fuxigpuframetrace=2'),check=True,timeout=30)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/AsyncPipelineFrontendTests.mm'),*frameworks,'-o',str(d/'async-pipelines')])
         subprocess.run([str(d/'async-pipelines')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_ASYNC_PIPELINES='1'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ScanoutFrontendTests.mm'),*frameworks,'-o',str(d/'scanout')])
@@ -89,6 +111,7 @@ def main():
         rgb=[line for line in rejects if 'fourcc0x5f524234' in line]
         assert len(rgb)==2 and all('/planes2/' in line and 'p0=size8x8/element1/row64/offset0' in line and 'p1=size8x8/element2/row64/offset4096' in line for line in rgb),mip.stderr
         print(mip.stdout,end='')
+        subprocess.run([str(d/'mips')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='fuxigpuskip=1'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/CAFrontendTests.mm'),*frameworks,'-o',str(d/'ca-frontend')])
         subprocess.run([str(d/'ca-frontend')],env=dict(os.environ,ASAN_OPTIONS='detect_leaks=0'),check=True,timeout=15)
         call(['xcrun','clang++','-std=c++17',*flags,str(ROOT/'tools/fuxi-metal/ConstantFrontendTests.mm'),*frameworks,'-o',str(d/'constant-frontend')])

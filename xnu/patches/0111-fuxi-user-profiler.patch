@@ -1,0 +1,250 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -106,6 +106,7 @@
+ bsd/dev/memdev.c			standard
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
++bsd/dev/sweet_prof.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/fuxi_touch.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -55,6 +55,7 @@
+ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
++extern void sweet_prof_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void fuxi_touch_init(void);
+@@ -941,6 +942,7 @@
+ 	 * Stack sampler only, and only on request. sweet_log_start() stays off: it
+ 	 * would write the tail of ufsroot0, which here is the HFS image itself.
+ 	 */
++	sweet_prof_start();
+ 	char smp[8];
+ 	if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp)) && smp[0] != '-') {
+ 		sweet_sample_start();
+--- a/osfmk/conf/files
++++ b/osfmk/conf/files
+@@ -124,6 +124,7 @@
+ osfmk/kern/ecc_logging.c			optional config_ecc_logging
+ osfmk/kern/energy_perf.c		standard
+ osfmk/kern/exception.c		standard
++osfmk/kern/sweet_prof_sample.c		standard
+ osfmk/kern/extmod_statistics.c		standard
+ osfmk/kern/host.c			standard
+ osfmk/kern/host_notify.c		standard
+--- /dev/null
++++ b/bsd/dev/sweet_prof.c
+@@ -0,0 +1,49 @@
++/* Opt-in single-process profiler; osfmk owns saved state and aggregation. */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/proc.h>
++#include <sys/proc_internal.h>
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <pexpert/pexpert.h>
++extern task_t proc_task(proc_t);
++extern int hz;
++extern void thread_terminate_self(void);
++extern void sweet_prof_task(task_t task,int pid);
++void sweet_prof_start(void);
++struct sp_target { task_t task; int pid; };
++static const char *sp_target_name="backboardd";
++static int sp_find(proc_t p,void *arg) {
++ struct sp_target *target=arg;char name[32];proc_name(proc_pid(p),name,sizeof(name));
++ if(!target->task && !strcmp(name,sp_target_name)) {
++  task_t task=proc_task(p);
++  if(task!=TASK_NULL){task_reference(task);target->task=task;target->pid=proc_pid(p);}
++ }
++ return PROC_RETURNED;
++}
++static unsigned sp_delay=60;
++static void sp_worker(__unused void *arg,__unused wait_result_t wr) {
++ static int event;
++ (void)tsleep(&event,PZERO,"sweetprof",(int)sp_delay*hz);
++ if(strcmp(sp_target_name,"backboardd"))printf("PROF target %s\n",sp_target_name);
++ struct sp_target target={0};proc_iterate(PROC_ALLPROCLIST,sp_find,&target,NULL,NULL);
++ if(target.task){sweet_prof_task(target.task,target.pid);task_deallocate(target.task);}
++ else printf("PROF %s unavailable\n",sp_target_name);
++ thread_terminate_self();
++}
++void sweet_prof_start(void) {
++ unsigned enabled=0;thread_t thread;
++ /* sweetprof=1: start after 60 s; sweetprof=N (2..3600): start after N s. 10000+N samples SpringBoard
++    instead; its lines keep the "PROF backboardd" prefix so the existing parsers still match. */
++ if(!PE_parse_boot_argn("sweetprof",&enabled,sizeof(enabled)) || !enabled)return;
++ if(enabled>=10000 && enabled<=13600){sp_target_name="SpringBoard";enabled-=10000;if(!enabled)enabled=1;}
++ if(enabled>3600)return;
++ if(enabled>1)sp_delay=enabled;
++ if(kernel_thread_start(sp_worker,NULL,&thread)==KERN_SUCCESS)thread_deallocate(thread);
++}
++#else
++void sweet_prof_start(void);
++void sweet_prof_start(void) {}
++#endif
+--- /dev/null
++++ b/osfmk/kern/sweet_prof_sample.c
+@@ -0,0 +1,86 @@
++/* Saved user stacks are approximate; no target suspension or logging per sweep. */
++#include <pexpert/arm64/board_config.h>
++#if defined(FUXI)
++#include <kern/task.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <kern/clock.h>
++#include <kern/kalloc.h>
++#include <kern/misc_protos.h>
++#include <kern/spl.h>
++#include <arm/thread.h>
++#include <arm64/proc_reg.h>
++#include <vm/vm_map.h>
++#include <vm/vm_shared_region.h>
++#include <string.h>
++#include "sweet_prof_logic.h"
++void sweet_prof_task(task_t task,int pid);
++static void sp_sleep(uint64_t deadline,uint64_t leeway) {
++ static int event;
++ assert_wait_deadline_with_leeway(&event,THREAD_UNINT,TIMEOUT_URGENCY_SYS_NORMAL|TIMEOUT_URGENCY_LEEWAY,deadline,leeway);
++ thread_block(THREAD_CONTINUE_NULL);
++}
++static void sp_sweep(task_t task,struct sp_table *p) {
++ thread_t thread;vm_map_t map=get_task_map(task);
++ task_lock(task);
++ queue_iterate(&task->threads,thread,thread_t,task_threads) {
++  struct sp_sample s={0};arm_saved_state_t *ss=find_user_regs(thread);
++  if(!ss || !is_saved_state64(ss)){p->skipped++;continue;}
++  spl_t level=splsched();thread_lock(thread);
++  int state=thread->state;
++  if(state&TH_TERMINATE){thread_unlock(thread);splx(level);p->skipped++;continue;}
++  s.tid=thread->thread_id;s.event=thread->wait_event;s.wr=thread->wait_result;
++  s.state=machine_thread_on_core(thread)?0:(state&TH_WAIT)?1:(state&TH_RUN)?2:3;
++  thread_unlock(thread);splx(level);
++  s.pc=get_saved_state_pc(ss);s.lr=get_saved_state_lr(ss);s.x16=(int32_t)get_saved_state_reg(ss,16);
++  uint64_t fp=get_saved_state_fp(ss),base=fp;
++  for(unsigned n=0;n<8 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
++   uint64_t frame[2];
++   if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
++   s.bt[n]=frame[1];if(frame[0]<=fp)break;fp=frame[0];
++  }
++  unsigned t=sp_thread_index(p,s.tid);
++  if(t==SP_THREADS)continue;
++  if(!p->threads[t].name[0] && get_bsdthread_info(thread))thread_get_thread_name(thread,p->threads[t].name);
++  sp_add(p,t,&s);
++ }
++ task_unlock(task);p->sweeps++;
++}
++/* Diagnostic: the calling thread's user frames plus the shared cache slide, one console line. */
++void sweet_prof_user_bt(const char *tag);
++void sweet_prof_user_bt(const char *tag) {
++ thread_t thread=current_thread();task_t task=current_task();arm_saved_state_t *ss=find_user_regs(thread);
++ if(!ss || !is_saved_state64(ss))return;
++ uint64_t slide=0,bt[12]={0};vm_shared_region_t sr=vm_shared_region_get(task);
++ if(sr){slide=sr->sr_slide;vm_shared_region_deallocate(sr);}
++ vm_map_t map=get_task_map(task);uint64_t fp=get_saved_state_fp(ss),base=fp;unsigned n=0;
++ for(;n<12 && fp && !(fp&7) && fp>=base && fp-base<1024*1024;n++) {
++  uint64_t frame[2];
++  if(vm_map_read_user(map,fp,frame,sizeof(frame))!=KERN_SUCCESS)break;
++  bt[n]=frame[1];if(frame[0]<=fp){n++;break;}fp=frame[0];
++ }
++ printf("%s slide 0x%llx pc 0x%llx lr 0x%llx bt",tag,(unsigned long long)slide,(unsigned long long)get_saved_state_pc(ss),(unsigned long long)get_saved_state_lr(ss));
++ for(unsigned i=0;i<n;i++)printf(" 0x%llx",(unsigned long long)bt[i]);
++ printf("\n");
++}
++void sweet_prof_task(task_t task,int pid) {
++ uint64_t deadline,period,leeway,duration;
++ struct sp_table *p=kalloc_data(sizeof(*p),Z_WAITOK|Z_ZERO);
++ if(!p){printf("PROF allocation failed\n");return;}
++ uint64_t slide=0;vm_shared_region_t sr=vm_shared_region_get(task);
++ if(sr){slide=sr->sr_slide;vm_shared_region_deallocate(sr);}
++ task_lock(task);uint64_t mh=task->mach_header_vm_address;task_unlock(task);
++ nanoseconds_to_absolutetime(2*NSEC_PER_MSEC,&period);nanoseconds_to_absolutetime(100*NSEC_PER_USEC,&leeway);
++ nanoseconds_to_absolutetime(60ULL*NSEC_PER_SEC,&duration);
++ uint64_t start=mach_absolute_time(),end=start+duration;deadline=start;
++ while(mach_absolute_time()<end) {
++  sp_sweep(task,p);
++  uint64_t now=mach_absolute_time();if(now>=end)break;deadline+=period;
++  if(deadline<=now){p->late++;deadline=now+period;}
++  if(deadline>end)deadline=end;
++  sp_sleep(deadline,leeway);
++ }
++ printf("PROF backboardd[%d] slide 0x%llx mh 0x%llx\n",pid,(unsigned long long)slide,(unsigned long long)mh);
++ sp_print(p);kfree_data(p,sizeof(*p));
++}
++#endif
+--- /dev/null
++++ b/osfmk/kern/sweet_prof_logic.h
+@@ -0,0 +1,68 @@
++#ifndef SWEET_PROF_LOGIC_H
++#define SWEET_PROF_LOGIC_H
++#define SP_THREADS 256u
++#define SP_BUCKETS 8192u
++#define SP_PROBES 64u
++#define SP_TOP 12u
++#define SP_LINES 398u
++struct sp_sample { uint64_t tid,pc,lr,bt[8],event; int x16,wr; unsigned state; };
++struct sp_key { struct sp_sample s; unsigned count,mixed,owner; };
++struct sp_thread { uint64_t tid; unsigned total,dropped; char name[64]; };
++struct sp_table { struct sp_key keys[SP_BUCKETS]; struct sp_thread threads[SP_THREADS]; unsigned nt,untracked,sweeps,late,skipped; };
++static unsigned sp_thread_index(struct sp_table *p,uint64_t tid) {
++ for(unsigned i=0;i<p->nt;i++)if(p->threads[i].tid==tid)return i;
++ if(p->nt==SP_THREADS){p->untracked++;return SP_THREADS;}
++ unsigned i=p->nt++;p->threads[i].tid=tid;return i;
++}
++static uint64_t sp_hash(const struct sp_sample *s) {
++ uint64_t h=s->tid^(s->state*0x9e3779b97f4a7c15ULL);
++ const uint64_t v[]={s->pc,s->lr,s->bt[0],s->bt[1]};
++ for(unsigned i=0;i<4;i++){h^=v[i];h^=h>>30;h*=0xbf58476d1ce4e5b9ULL;h^=h>>27;}
++ return h^(h>>31);
++}
++static int sp_equal(const struct sp_sample *a,const struct sp_sample *b) {
++ return a->tid==b->tid && a->state==b->state && a->pc==b->pc && a->lr==b->lr && a->bt[0]==b->bt[0] && a->bt[1]==b->bt[1];
++}
++static void sp_add(struct sp_table *p,unsigned owner,const struct sp_sample *s) {
++ struct sp_thread *t=&p->threads[owner];t->total++;
++ unsigned hash=(unsigned)sp_hash(s);
++ for(unsigned i=0;i<SP_PROBES;i++) {
++  struct sp_key *k=&p->keys[(hash+i)&(SP_BUCKETS-1)];
++  if(!k->count){k->s=*s;k->owner=owner;k->count=1;return;}
++  if(sp_equal(&k->s,s)) {
++   k->count++;k->mixed|=k->s.x16!=s->x16 || k->s.event!=s->event || k->s.wr!=s->wr || k->s.bt[2]!=s->bt[2] || k->s.bt[3]!=s->bt[3];return;
++  }
++ }
++ t->dropped++;
++}
++static void sp_name(char *name) {
++ name[63]=0;
++ for(unsigned i=0;name[i];i++)if((unsigned char)name[i]<=32 || (unsigned char)name[i]>126)name[i]='_';
++ if(!name[0]){name[0]='-';name[1]=0;}
++}
++static void sp_print(struct sp_table *p) {
++ static const char * const states[]={"run","wait","ready","stop"};
++ unsigned omitted=0,quota=p->nt?(SP_LINES-p->nt)/p->nt:0,extra=p->nt?(SP_LINES-p->nt)%p->nt:0;
++ for(unsigned t=0;t<p->nt;t++) {
++  struct sp_key *top[SP_TOP]={0};struct sp_thread *th=&p->threads[t];
++  for(unsigned i=0;i<SP_BUCKETS;i++) {
++   struct sp_key *k=&p->keys[i];if(!k->count || k->owner!=t)continue;
++   for(unsigned n=0;n<SP_TOP;n++)if(!top[n] || k->count>top[n]->count) {
++    for(unsigned j=SP_TOP-1;j>n;j--)top[j]=top[j-1];top[n]=k;break;
++   }
++  }
++  unsigned limit=quota+(t<extra);if(limit>SP_TOP)limit=SP_TOP;
++  sp_name(th->name);
++  printf("PROF backboardd t%llu name=%s total=%u dropped=%u\n",(unsigned long long)th->tid,th->name,th->total,th->dropped);
++  for(unsigned n=0;n<SP_TOP && top[n];n++) {
++   if(n==limit){omitted++;break;}
++   struct sp_key *k=top[n];struct sp_sample *s=&k->s;
++   printf("PROF backboardd t%llu name=%s n=%u/%u state=%s x16=%d wait=0x%llx wr=%d mixed=%u pc 0x%llx lr 0x%llx bt 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx 0x%llx\n",
++    (unsigned long long)th->tid,th->name,k->count,th->total,states[s->state],s->x16,(unsigned long long)s->event,s->wr,k->mixed,
++    (unsigned long long)s->pc,(unsigned long long)s->lr,(unsigned long long)s->bt[0],(unsigned long long)s->bt[1],(unsigned long long)s->bt[2],(unsigned long long)s->bt[3],
++    (unsigned long long)s->bt[4],(unsigned long long)s->bt[5],(unsigned long long)s->bt[6],(unsigned long long)s->bt[7]);
++  }
++ }
++ printf("PROF done threads=%u sweeps=%u late=%u skipped=%u untracked=%u truncated=%u\n",p->nt,p->sweeps,p->late,p->skipped,p->untracked,omitted);
++}
++#endif

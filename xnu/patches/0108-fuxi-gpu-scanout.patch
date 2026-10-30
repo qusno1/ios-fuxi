@@ -1,25 +1,477 @@
 --- a/iokit/Kernel/arm/SweetSurface.cpp
 +++ b/iokit/Kernel/arm/SweetSurface.cpp
-@@ -134,7 +134,10 @@
+@@ -34,6 +34,7 @@
+ #include <IOKit/IOLib.h>
+ #include <IOKit/IOLocks.h>
+ #include <IOKit/system.h>
++#include <pexpert/pexpert.h>
+ #include <libkern/c++/OSArray.h>
+ #include <libkern/c++/OSDictionary.h>
+ #include <libkern/c++/OSNumber.h>
+@@ -63,7 +64,17 @@
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+ #define SWEET_SURFACE_MAX_PROPS         (64u << 10)
+ #define SWEET_SURFACE_ROW_ALIGN         64
++/* backboardd's Metal renderer only ever wraps 4-byte single-plane surfaces whose
++ * row is 256-aligned (all its own surfaces are). MaterialKit snapshot surfaces ask
++ * for CGBitmapGetAlignedBytesPerRow (32-byte) rows, so CARenderServerSnapshot
++ * left them unrendered and the opaque App Library background stayed black.
++ * Explicit rows are a minimum (clients query the row back), and the allocation
++ * covers the height padded to 4 rows that a Turnip linear import requires;
++ * sweetsurfrow=0 keeps the requested layout. */
++#define SWEET_SURFACE_GPU_ROW_ALIGN     256
+ #define SWEET_SURFACE_TIMESTAMPS        0x800   /* offset in the state page */
++#define SWEET_SURFACE_STATE_USE         0x18
++#define SWEET_SURFACE_USE_MAX           65535u
+ #define SWEET_SURFACE_STATE_SEED        0xc     /* u32 in the state page */
+ #define kIOSurfaceLockReadOnly          0x1
+ 
+@@ -72,8 +83,36 @@
+ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
+ static uint32_t      sweet_surface_next_id = 1;
+ static uint32_t      sweet_surface_creates_logged;
++static SInt32        sweet_surface_bts_logged;
++extern "C" void sweet_prof_user_bt(const char *tag);
+ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
++
++static void sweet_surface_use_publish(SweetSurface *s)
++{
++ uint64_t value = ((uint64_t)s->useCounts[1] << 32) | (s->useCounts[0] + s->displayUses + s->usePoisoned);
++ __atomic_store_n((uint64_t *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_USE), value, __ATOMIC_RELEASE);
++}
++#if defined(FUXI)
++void sweet_surface_display_poison(SweetSurface *s)
++{
++ IOLockLock(sweet_surface_lock); s->usePoisoned = true; sweet_surface_use_publish(s); IOLockUnlock(sweet_surface_lock);
++}
++#endif
++bool sweet_surface_display_hold(SweetSurface *s)
++{
++ IOLockLock(sweet_surface_lock);
++ bool ok = s->displayUses < SWEET_SURFACE_USE_MAX;
++ if (ok) { s->displayUses++; sweet_surface_use_publish(s); }
++ IOLockUnlock(sweet_surface_lock);
++ return ok;
++}
++void sweet_surface_display_drop(SweetSurface *s)
++{
++ IOLockLock(sweet_surface_lock);
++ if (s->displayUses) { s->displayUses--; sweet_surface_use_publish(s); }
++ IOLockUnlock(sweet_surface_lock);
++}
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+@@ -86,19 +125,34 @@
+  uint64_t length, pageGeneration, generation, age;
+  bool quarantine;
+ };
+-static IOLock *sweet_gpu_lock;
++/* Cache -> lease only; producer leases never take the cache lock. */
++static IOLock *sweet_gpu_lock, *sweet_writer_lock;
++static SweetSurface *sweet_gpu_submitting;
+ static sweet_gpu_backing sweet_gpu_cache[FG_CACHE_SLOTS];
+ static uint64_t sweet_gpu_generation, sweet_gpu_age;
+ static struct fg_times sweet_gpu_times;
+ static SweetSurface *sweet_gpu_inflight; /* strong until fence/drain */
++#define kIOSurfaceLockAvoidSync 0x2
++static SweetSurface *sweet_present_readers[4];
++static unsigned sweet_present_count;
++static void (*sweet_present_wake)(void *);
++static void *sweet_present_context;
+ static unsigned sweet_gpu_slot;
+ static uint64_t sweet_gpu_begin;
++/* fuxigpuncimport bit 20: pre-cleans, skips (no writer since the last clean) and the zero-copy
++ * class of each submitted frame (sweet_surface_scanout_class), logged with the 600-frame split. */
++static unsigned sweet_gpu_precleans, sweet_gpu_preclean_skips, sweet_gpu_zc[8];
+ static bool sweet_gpu_init(void)
+ {
+  if (!sweet_gpu_lock) {
+   IOLock *lock = IOLockAlloc();
+   if (!lock) return false;
+   if (!OSCompareAndSwapPtr(NULL, lock, &sweet_gpu_lock)) IOLockFree(lock);
++ }
++ if (!sweet_writer_lock) {
++  IOLock *lock = IOLockAlloc();
++  if (!lock) return false;
++  if (!OSCompareAndSwapPtr(NULL, lock, &sweet_writer_lock)) IOLockFree(lock);
+  }
+  return true;
+ }
+@@ -134,7 +188,31 @@
   uint64_t cpu = thread_get_runtime_self(), start = mach_absolute_time();
   IOLockLock(sweet_gpu_lock);
   if (sweet_gpu_inflight) { IOLockUnlock(sweet_gpu_lock); return 2; }
 - if (s->gpuWriters || s->gpuQuarantined) { IOLockUnlock(sweet_gpu_lock); return 0; }
++ IOLockLock(sweet_writer_lock);
 + if (s->gpuWriters || s->gpuQuarantined) {
-+  IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
++  IOLockUnlock(sweet_writer_lock); IOLockUnlock(sweet_gpu_lock); return fuxi_gpu_scanout_owned() ? 3 : 0;
 + }
-+ if (!fuxi_gpu_scanout_reserve()) { IOLockUnlock(sweet_gpu_lock); return 3; }
++ sweet_gpu_submitting = s;
++ /* Bit 20: clean before the reservation, so client submits are not held across it. Writers
++  * wait while submitting == s; one that arrives later bumps the serial and forces a clean. */
++ bool preclean = fuxi_gpu_scanout_preclean(), clean = false;
++ uint64_t cleanSerial = s->gpuWriterSerial, cleanEpoch = s->gpuWriterEpoch;
++ if (preclean) clean = !s->gpuCleanValid || s->gpuCleanSerial != cleanSerial || s->gpuCleanEpoch != cleanEpoch;
++ IOLockUnlock(sweet_writer_lock);
++ if (clean) {
++  uint64_t began = mach_absolute_time();
++  fuxi_gpu_clean_source(src+s->offset, s->memory->getLength()-s->offset);
++  sweet_gpu_times.clean += mach_absolute_time()-began;
++  sweet_gpu_precleans++;
++  IOLockLock(sweet_writer_lock);
++  s->gpuCleanSerial = cleanSerial; s->gpuCleanEpoch = cleanEpoch; s->gpuCleanValid = true;
++  IOLockUnlock(sweet_writer_lock);
++ } else if (preclean) sweet_gpu_preclean_skips++;
++ if (!fuxi_gpu_scanout_reserve()) {
++  IOLockLock(sweet_writer_lock); sweet_gpu_submitting = NULL;
++  IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
++  IOLockUnlock(sweet_gpu_lock); return 3;
++ }
   unsigned slot = FG_CACHE_SLOTS, victim = 0, replacement = FG_CACHE_SLOTS;
   uint64_t length = s->memory->getLength()-s->offset;
   uintptr_t source = src+s->offset;
-@@ -186,6 +189,7 @@
+@@ -174,6 +252,12 @@
+  sweet_gpu_cache[slot].age = ++sweet_gpu_age;
+  result = fuxi_gpu_copy(slot, sweet_gpu_cache[slot].generation, source, length,
+      s->bytesPerRow, sx, sy, dx, dy, width, height, &sweet_gpu_times);
++ if (result == 2 && preclean) {
++  unsigned c = width < 1080 || height < 2400 ? 4 : sweet_surface_scanout_class(s,
++      s->offset+(uint64_t)sy*s->bytesPerRow+(uint64_t)sx*4, (uint64_t)(height-1)*s->bytesPerRow+(uint64_t)width*4);
++  sweet_gpu_zc[c < 8 ? c : 0]++;
++ }
++ IOLockLock(sweet_writer_lock);
+  if (result == 2) {
+   s->retain();
+   sweet_gpu_inflight = s;
+@@ -182,10 +266,14 @@
+  }
+  if (result < 0) {
+   sweet_gpu_cache[slot].quarantine = true;
+-  s->gpuQuarantined = true;
++  s->gpuQuarantined = true; sweet_surface_display_poison(s);
    s->retain(); /* failed submit/drain: reject writers, preserve until reset */
   }
++ IOLockUnlock(sweet_writer_lock);
   out:
++ IOLockLock(sweet_writer_lock); sweet_gpu_submitting = NULL;
++ IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false); IOLockUnlock(sweet_writer_lock);
 + fuxi_gpu_scanout_release();
   sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
   IOLockUnlock(sweet_gpu_lock);
   return result;
+@@ -203,14 +291,16 @@
+   result = fuxi_gpu_poll(&sweet_gpu_times);
+   if (result) {
+    *elapsed = mach_absolute_time()-sweet_gpu_begin;
++   IOLockLock(sweet_writer_lock);
+    if (result == -2) {
+     sweet_gpu_cache[sweet_gpu_slot].quarantine = true;
+-    sweet_gpu_inflight->gpuQuarantined = true;
++    sweet_gpu_inflight->gpuQuarantined = true; sweet_surface_display_poison(sweet_gpu_inflight);
+    }
+    else release = sweet_gpu_inflight;
+    /* Failed-drain surface AND descriptor stay retained until reset. */
+    sweet_gpu_inflight = NULL;
+-   IOLockWakeup(sweet_gpu_lock, &sweet_gpu_inflight, false);
++   IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false);
++   IOLockUnlock(sweet_writer_lock);
+   }
+  }
+  sweet_gpu_times.cpu += thread_get_runtime_self()-cpu;
+@@ -218,21 +308,73 @@
+  if (release) release->release(); /* free() takes the cache lock */
+  return result;
+ }
+-/* IOSurface writer traps wait on the producer thread, never the display
+- * timer. A writer already holding the surface makes GPU submission ineligible.
+- * Userspace must obey IOSurface lock/unlock when writing a mapped surface. */
+-static bool sweet_gpu_writer(SweetSurface *s, bool lock)
++bool sweet_surface_present_begin(SweetSurface **surfaces, unsigned count, uint64_t *ready = NULL, const uint64_t *epochs = NULL)
++{
++ if (count > 4 || !sweet_gpu_init()) return false;
++ IOLockLock(sweet_writer_lock);
++ bool ok = sweet_present_count == 0;
++ for (unsigned i = 0; i < count; i++) if (surfaces[i]->gpuWriters || surfaces[i]->gpuQuarantined ||
++     (epochs && surfaces[i]->gpuWriterEpoch != epochs[i])) ok = false;
++ if (ok) {
++  for (unsigned i = 0; i < count; i++) {
++   sweet_present_readers[i] = surfaces[i];
++   if (ready && surfaces[i]->gpuReadyTime > *ready) *ready = surfaces[i]->gpuReadyTime;
++  }
++  sweet_present_count = count;
++ }
++ IOLockUnlock(sweet_writer_lock);
++ return ok;
++}
++void sweet_surface_present_end(void)
++{
++ IOLockLock(sweet_writer_lock);
++ sweet_present_count = 0;
++ IOLockWakeup(sweet_writer_lock, &sweet_gpu_inflight, false);
++ IOLockUnlock(sweet_writer_lock);
++}
++void sweet_surface_present_notify(void (*wake)(void *), void *context)
++{
++ if (!sweet_gpu_init()) return;
++ IOLockLock(sweet_writer_lock);
++ sweet_present_wake = wake; sweet_present_context = context;
++ IOLockUnlock(sweet_writer_lock);
++}
++static bool sweet_surface_present_reading(SweetSurface *s)
++{
++ for (unsigned i = 0; i < sweet_present_count; i++) if (sweet_present_readers[i] == s) return true;
++ return false;
++}
++/* AvoidSync reserves a pending producer without waiting; it must take a
++ * normal writer lease before touching pixels. Display reads never sleep. */
++static bool sweet_gpu_writer(SweetSurface *s, bool lock, bool pending = false)
+ {
+  if (!sweet_gpu_init()) return false;
+- IOLockLock(sweet_gpu_lock);
++ IOLockLock(sweet_writer_lock);
+  if (lock) {
+-  while (sweet_gpu_inflight == s)
+-   IOLockSleep(sweet_gpu_lock, &sweet_gpu_inflight, THREAD_UNINT);
+-  if (!s->gpuQuarantined) s->gpuWriters++;
+- } else if (s->gpuWriters) s->gpuWriters--;
++  if (s->gpuWriters == ~0u || s->gpuWriterSerial == ~0ull || s->gpuWriterEpoch == ~0ull) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
++  if (s->gpuQuarantined) { IOLockUnlock(sweet_writer_lock); return false; }
++  s->gpuWriterSerial++;
++  /* Pending-to-active conversion stays in the outstanding writer epoch. */
++  if (!s->gpuWriters) s->gpuWriterEpoch++;
++  while (!pending && (sweet_gpu_submitting == s || sweet_gpu_inflight == s || sweet_surface_present_reading(s)))
++   IOLockSleep(sweet_writer_lock, &sweet_gpu_inflight, THREAD_UNINT);
++  if (s->gpuWriters == ~0u) { s->gpuQuarantined = true; sweet_surface_display_poison(s); }
++  if (!s->gpuQuarantined) { s->gpuWriters++; fuxi_gpu_present_writer(s->id, !pending); } /* bit 16: lock-free, no GPU lock */
++ } else if (s->gpuWriters && !--s->gpuWriters && !s->gpuQuarantined) {
++  s->gpuReadyTime = mach_absolute_time();
++  if (sweet_present_wake) sweet_present_wake(sweet_present_context);
++ }
+  bool ok = !s->gpuQuarantined;
+- IOLockUnlock(sweet_gpu_lock);
++ IOLockUnlock(sweet_writer_lock);
+  return ok;
++}
++uint64_t sweet_surface_writer_serial(SweetSurface *s, uint64_t *epoch)
++{
++ if (!sweet_gpu_init()) { if (epoch) *epoch = ~0ull; return ~0ull; }
++ IOLockLock(sweet_writer_lock);
++ uint64_t serial = s->gpuWriterSerial; if (epoch) *epoch = s->gpuWriterEpoch;
++ IOLockUnlock(sweet_writer_lock);
++ return serial;
+ }
+ void sweet_surface_gpu_stats(struct fg_times *t)
+ {
+@@ -241,7 +383,30 @@
+  IOLockLock(sweet_gpu_lock);
+  *t = sweet_gpu_times;
+  bzero(&sweet_gpu_times, sizeof(sweet_gpu_times));
++ if (fuxi_gpu_scanout_preclean()) {
++  IOLog("FUXI SCANOUT: preclean cleans=%u skips=%u zerocopy eligible=%u format=%u stride=%u size=%u backing=%u scattered=%u high=%u unknown=%u\n",
++      sweet_gpu_precleans, sweet_gpu_preclean_skips, sweet_gpu_zc[1], sweet_gpu_zc[2], sweet_gpu_zc[3], sweet_gpu_zc[4],
++      sweet_gpu_zc[5], sweet_gpu_zc[6], sweet_gpu_zc[7], sweet_gpu_zc[0]);
++  sweet_gpu_precleans = sweet_gpu_preclean_skips = 0; bzero(sweet_gpu_zc, sizeof(sweet_gpu_zc));
++ }
+  IOLockUnlock(sweet_gpu_lock);
++}
++/* Zero-copy survey, read only: could VIG0 fetch [offset, offset+bytes) directly? 1 yes (one
++ * physical run below 4 GiB: SRC0 is a 32-bit PA, the display SMMU is untouched), 2 format,
++ * 3 stride (64-byte multiple, 16-bit YSTRIDE0), 5 backing, 6 scattered pages, 7 above 4 GiB.
++ * Size (4) is the caller's crop test. A wired IOBuffer's pages never move: cache the class. */
++unsigned sweet_surface_scanout_class(SweetSurface *s, uint64_t offset, uint64_t bytes)
++{
++ if (s->pixelFormat != 0x42475241u || s->bytesPerElement != 4 || s->elementWidth != 1 || s->elementHeight != 1) return 2;
++ if ((s->bytesPerRow & 63) || s->bytesPerRow > 0xffffu) return 3;
++ IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
++ if (!buffer || !bytes || offset+bytes > buffer->getLength()) return 5;
++ if (!s->scanoutClass) {
++  IOByteCount length = 0;
++  addr64_t pa = buffer->getPhysicalSegment(offset, &length, kIOMemoryMapperNone);
++  s->scanoutClass = !pa ? 5 : pa+bytes > (1ull << 32) ? 7 : length < bytes ? 6 : 1;
++ }
++ return s->scanoutClass;
+ }
+ #endif
+ 
+@@ -447,6 +612,18 @@
+ 	return (uint32_t)((row + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1));
+ }
+ 
++static bool
++sweet_surface_gpu_rows(void)
++{
++	static int enabled = -1;
++	if (enabled < 0) {
++		uint32_t v = 1;
++		(void)PE_parse_boot_argn("sweetsurfrow", &v, sizeof(v));
++		enabled = v != 0;
++	}
++	return enabled != 0;
++}
++
+ /* Geometry from the creation properties (IOSurface.h keys). */
+ static IOReturn
+ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
+@@ -470,7 +647,16 @@
+ 	if (s->bytesPerRow < (uint64_t)sweet_div_up(s->width, s->elementWidth) * s->bytesPerElement) {
+ 		return kIOReturnBadArgument;
+ 	}
+-	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * sweet_div_up(s->height, s->elementHeight);
++	uint32_t rows = sweet_div_up(s->height, s->elementHeight);
++	if (s->bytesPerElement == 4 && props->getObject("IOSurfacePlaneInfo") == NULL && sweet_surface_gpu_rows()) {
++		if ((s->bytesPerRow & (SWEET_SURFACE_GPU_ROW_ALIGN - 1)) != 0) {
++			s->bytesPerRow = (s->bytesPerRow + SWEET_SURFACE_GPU_ROW_ALIGN - 1) & ~(uint32_t)(SWEET_SURFACE_GPU_ROW_ALIGN - 1);
++		}
++		/* Turnip sizes a linear image's last level for a height padded to 4 rows
++		 * (blit over-fetch), so a 1065x282 import needs 284 rows of memory. */
++		rows = (rows + 3) & ~3u;
++	}
++	end = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * rows;
+ 
+ 	OSArray *planes = OSDynamicCast(OSArray, props->getObject("IOSurfacePlaneInfo"));
+ 	s->planeCount = 0;
+@@ -528,6 +714,7 @@
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++ uint32_t uses[2];
+ 
+ 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+@@ -541,6 +728,10 @@
+ 	OSSafeReleaseNULL(data);
+ 	OSSafeReleaseNULL(state);
+ 	if (surface != NULL) {
++  IOLockLock(sweet_surface_lock);
++  for (unsigned i = 0; i < 2; i++) surface->useCounts[i] -= uses[i];
++  sweet_surface_use_publish(surface);
++  IOLockUnlock(sweet_surface_lock);
+ 		sweet_surface_put(surface);
+ 		surface->release();
+ 		surface = NULL;
+@@ -591,7 +782,9 @@
+ 	    void *reference) APPLE_KEXT_OVERRIDE;
+ 	IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+ 
+-	IOReturn trapUseCount(void *id, void *category, void *, void *, void *, void *);
++	IOReturn useCount(uint32_t id, uint32_t category, bool increment);
++ IOReturn trapIncrementUse(void *id, void *category, void *, void *, void *, void *);
++ IOReturn trapDecrementUse(void *id, void *category, void *, void *, void *, void *);
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
+@@ -882,6 +1075,14 @@
+ 		    name, s->id, s->width, s->height, s->pixelFormat, s->bytesPerElement,
+ 		    s->bytesPerRow, s->planeCount, s->allocSize, props->getCount(), ret);
+ 	}
++	/* Which client code asks for multi-plane non-BGRA layouts (App Library 'b3a8'): first 8, with a user backtrace. */
++	if (ret == kIOReturnSuccess && s->planeCount > 1 && s->pixelFormat != 0x42475241u &&
++	    OSIncrementAtomic(&sweet_surface_bts_logged) < 8) {
++		char name[32], tag[96];
++		proc_selfname(name, sizeof(name));
++		snprintf(tag, sizeof(tag), "SWEET SURF: bt %s id %u fmt 0x%x", name, s->id, s->pixelFormat);
++		sweet_prof_user_bt(tag);
++	}
+ 	props->release();
+ 	if (ret != kIOReturnSuccess) {
+ 		s->release();
+@@ -956,11 +1157,34 @@
+ 	}
+ }
+ 
+-IOReturn
+-IOSurfaceRootUserClient::trapUseCount(__unused void *id, __unused void *category,
+-    void *, void *, void *, void *)
+-{
+-	return kIOReturnSuccess;
++IOReturn IOSurfaceRootUserClient::useCount(uint32_t id, uint32_t category, bool increment)
++{
++ if (category >= 2) return kIOReturnBadArgument;
++ IOLockLock(fLock);
++ SweetSurfaceRef *ref = findRef(id, NULL);
++ IOReturn ret = kIOReturnNotFound;
++ if (ref) {
++  IOLockLock(sweet_surface_lock);
++  uint32_t &local = ref->uses[category], &total = ref->surface->useCounts[category];
++  ret = kIOReturnBadArgument;
++  if (increment ? total < SWEET_SURFACE_USE_MAX : local != 0) {
++   if (increment) { local++; total++; } else { local--; total--; }
++   sweet_surface_use_publish(ref->surface); ret = kIOReturnSuccess;
++  }
++  IOLockUnlock(sweet_surface_lock);
++ }
++ IOLockUnlock(fLock);
++ return ret;
++}
++IOReturn IOSurfaceRootUserClient::trapIncrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++ if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
++ return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, true);
++}
++IOReturn IOSurfaceRootUserClient::trapDecrementUse(void *id, void *category, void *, void *, void *, void *)
++{
++ if ((uintptr_t)id > UINT32_MAX || (uintptr_t)category >= 2) return kIOReturnBadArgument;
++ return useCount((uint32_t)(uintptr_t)id, (uint32_t)(uintptr_t)category, false);
+ }
+ 
+ static IOReturn
+@@ -1001,7 +1225,7 @@
+ 		return kIOReturnNotFound;
+ 	}
+ #if defined(FUXI)
+- if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true)) {
++ if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && !sweet_gpu_writer(s, true, ((uintptr_t)options & kIOSurfaceLockAvoidSync) != 0)) {
+   s->release(); return kIOReturnNotReady;
+  }
+ #endif
+@@ -1041,8 +1265,8 @@
+ }
+ 
+ static IOExternalTrap sweet_surface_traps[] = {
+-	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+-	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
++	[kSweetSurfaceTrapIncrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapIncrementUse },
++	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDecrementUse },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+ 	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -29,9 +29,16 @@
+ 
+ public:
+ 	uint32_t id;
++ uint32_t useCounts[2], displayUses;
++ bool usePoisoned;
+ #if defined(FUXI)
+  unsigned gpuWriters;
++ uint64_t gpuReadyTime, gpuWriterSerial, gpuWriterEpoch;
+  bool gpuQuarantined;
++ /* fuxigpuncimport bit 20: writer serial/epoch at the last pre-clean; zero-copy survey class. */
++ uint64_t gpuCleanSerial, gpuCleanEpoch;
++ bool gpuCleanValid;
++ uint8_t scanoutClass;
+ #endif
+ 	uint32_t width, height, bytesPerRow, offset, pixelFormat, allocSize;
+ 	uint16_t bytesPerElement;
+@@ -59,10 +66,15 @@
+     unsigned, unsigned, unsigned, unsigned);
+ int sweet_surface_gpu_poll(uint64_t *);
+ void sweet_surface_gpu_stats(struct fg_times *);
++void sweet_surface_display_poison(SweetSurface *);
++uint64_t sweet_surface_writer_serial(SweetSurface *, uint64_t *epoch = NULL);
++unsigned sweet_surface_scanout_class(SweetSurface *, uint64_t offset, uint64_t bytes);
+ #endif
+ 
+ /* Retained surface for an id, or NULL. */
+ SweetSurface *sweet_surface_copy(uint32_t id);
++bool sweet_surface_display_hold(SweetSurface *);
++void sweet_surface_display_drop(SweetSurface *);
+ 
+ /*
+  * Publish physical memory (the panel framebuffer) as a surface. Returns a
 --- a/pexpert/arm/pe_serial.c
 +++ b/pexpert/arm/pe_serial.c
 @@ -730,5 +730,8 @@

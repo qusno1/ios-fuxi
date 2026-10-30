@@ -1,0 +1,23 @@
+Ported from UniXNU patches/mesa/turnip-darwin-kmd.patch (BSD-2-Clause-Patent),
+commit "perf(turnip): wait for a fence up to 100 ms a call"; the pinned UniXNU
+revision still slices at 1 ms. Applied after mesa-fuxi-smoke.patch, which
+already clamps the slice to the remaining timeout.
+
+turnip/darwin: wait for a fence up to 100 ms per kernel call instead of 1 ms.
+
+A frame's fence wait was several IOKit calls (UniXNU i553: 258682 waits in
+166 s, 97 % timed out). The kernel WaitFence polls until the fence retires or
+the slice ends, so a longer slice only removes the user/kernel round trips; the
+connection lock is still released between slices and the remaining timeout
+still bounds the last slice.
+
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -177,6 +177,6 @@
+    for (;;) {
+       uint64_t now = os_time_get_nano();
+-      uint64_t slice = 1000000; /* 1 ms */
++      uint64_t slice = 100000000; /* 100 ms */
+       if (abs_timeout_ns != UINT64_MAX)
+          slice = abs_timeout_ns <= now ? 0 : MIN2(slice, abs_timeout_ns - now);
+       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};

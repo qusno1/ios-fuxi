@@ -15,6 +15,9 @@ struct ResourceLimits {
  bool extent(size_t w,size_t h,size_t pixel) const {
   return w && h && w<=dimension && h<=dimension && pixel && w<=single/pixel && h<=single/(w*pixel);
  }
+ bool volume(size_t w,size_t h,size_t d,size_t pixel) const {
+  return extent(w,h,pixel) && d && d<=dimension && d<=single/(w*h*pixel);
+ }
  bool rows(size_t w,size_t h,size_t pixel,size_t row,size_t offset,size_t length) const {
   return extent(w,h,pixel) && row>=w*pixel && row%pixel==0 && offset<=length && row<=single/h && row*h<=length-offset;
  }

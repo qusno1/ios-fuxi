@@ -29,7 +29,7 @@
  	sweet_sample_start();
 --- a/bsd/dev/fuxi_wlan.c
 +++ b/bsd/dev/fuxi_wlan.c
-@@ -0,0 +1,5007 @@
+@@ -0,0 +1,5315 @@
 +/*
 + * FUXI WLAN (lane-wlan milestones 4/5/6): WCN7850 power-up, PCIe0 link, BAR0
 + * assignment and a read-only MHI/BHI register dump from XNU.
@@ -55,6 +55,10 @@
 + *   fuxiwlanstop22=1  retain the BHI-only diagnostic stop (default: continue)
 + *   fuxiwlankeep=1  retain DMA/device only after complete selected milestone success
 + *   fuxiwlanmlo=1  ath12k PHY_CAP/MLO negotiation; =2 omit MLO (W12+; default unchanged)
++ *                 P17 bits ORed on top (all default off, see wlan-p17.md): 0x4 HOST_CAP TLV 0x33,
++ *                 0x8 always send MLO TLVs, 0x10 log PHY_CAP TLV 0x17 (needs =1), 0x20 DMA IOVA
++ *                 align to 2^n of size, 0x40 read-only PMK8550 gpio3 sleep clock log, 0x80 also
++ *                 enable it, 0x100 decode BHI error words and scan RDDM text
 + *   fuxiwlanqrtr=1  W11 capability-only diagnostic; =2 W12 setup; =3 W13 small-chunk negotiation; =4 W14 downloads; =5 W15 config/mode
 + *   fuxiwlanw15=1  W15 only: omit WLAN_CFG shadow-v3 TLV (default 0)
 + *   fuxiwlanw16=N  qrtr=5 only: 1 larger IPCR, 2 doorbell redrive, 3 both,
@@ -105,6 +109,7 @@
 +#include <vm/vm_kern.h>
 +#include <vm/pmap.h>
 +#include <arm/caches_internal.h>
++#include "sweet_spmi_bus.h"
 +/* osfmk/vm/pmap.h declares these under MACH_KERNEL_PRIVATE only; bsd/ cannot
 + * see them, but they are in the same kernel image (M6k fuxiwlanprobe=nc). */
 +/* pexpert exposes the string-only parser under XNU_KERNEL_PRIVATE. */
@@ -758,6 +763,131 @@
 +static unsigned wl_rails_variant;
 +static bool wl_rails_requested;
 +static bool wl16_large, wl16_redrive;
++/* ---- P17: opt-in WCN7850 MODE-silence probes (fuxiwlanmlo bits >= 4) ----
++ * Low two bits keep the W12 meaning (1 PHY_CAP, 2 omit MLO). Bits:
++ *   0x004 HOSTMEM   HOST_CAP vendor TLV 0x33 (u8 1, "host memory on demand")
++ *   0x008 MLOALL    send the HOST_CAP MLO TLVs whatever PHY_CAP said
++ *   0x010 PHY17     decode and log PHY_CAP reply TLV 0x17 (needs mlo=1)
++ *   0x020 DMAALIGN  align every DMA IOVA to its size rounded up to 2^n
++ *   0x040 CLKCHECK  read-only log of PMK8550 gpio3 (32 kHz sleep clock)
++ *   0x080 CLKON     as CLKCHECK, then enable the pin if it is not an output
++ *   0x100 ERRDEC    decode BHI error words; scan RDDM text on a crash
++ * The pin sequence, the power-of-two alignment rule and the text scan are
++ * adapted from UniXNU-sheng package/WifiProbe.cpp (08cde20, SPDX
++ * BSD-2-Clause-Patent, Copyright (c) 2026 UniXNU contributors): pmicPrepare,
++ * arenaAlloc and rddmScan/looksLikeError. The sheng source has no WLFW code,
++ * so TLV 0x33 (u8 1) and PHY TLV 0x17 come from the lane brief, unverified
++ * against firmware; the MLO TLVs reuse this file's own HOST_CAP codec. */
++#define WL17_HOSTMEM 0x004u
++#define WL17_MLOALL 0x008u
++#define WL17_PHY17 0x010u
++#define WL17_DMAALIGN 0x020u
++#define WL17_CLKCHECK 0x040u
++#define WL17_CLKON 0x080u
++#define WL17_ERRDEC 0x100u
++#define WL17_MASK 0x1fcu
++static unsigned wl17_bits;
++static unsigned wl17_phy17_len;
++static uint64_t wl17_phy17_val;
++
++/* Links to put in HOST_CAP MLO TLVs: 0 omits them, -1 refuses (num_phy > 2). */
++static int
++wl17_mlo_links(unsigned variant, unsigned bits, bool enabled, unsigned num)
++{
++	if (variant == 2) { return 0; }
++	if (enabled && num && num != 255) { return num > 2 && !(bits & WL17_MLOALL) ? -1 : (num > 2 ? 2 : (int)num); }
++	return (bits & WL17_MLOALL) ? (num == 1 ? 1 : 2) : 0;
++}
++
++/* PHY_CAP TLV 0x17: width unknown, keep length and up to 8 LE bytes. */
++static void
++wl17_phy17_parse(const uint8_t *p, unsigned n)
++{
++	wl17_phy17_len = n; wl17_phy17_val = 0;
++	for (unsigned i = 0; i < n && i < 8; i++) { wl17_phy17_val |= (uint64_t)p[i] << (8*i); }
++}
++
++static uint64_t
++wl17_align(uint64_t size)
++{
++	uint64_t align = 4096;
++	while (align < size && align < (1ull << 40)) { align <<= 1; }
++	return align;
++}
++
++/* PMK8550 gpio3 = SID 0 page 0xba. regs 04 05 40 44 46 as read over SPMI. */
++#define WL17_CLK_PPID 0x0bau
++struct wl17_gpio { uint8_t type, sub, mode, func, en; };
++struct wl17_wr { uint8_t reg, val; };
++static const struct wl17_wr wl17_clk_writes[5] = {
++	{0x42, 5}, {0x41, 0}, {0x44, 2}, {0x40, 1}, {0x46, 0x80}
++};
++/* 0xff already an enabled output of function index 2; 0 write needed;
++ * 3 the pin belongs to another EE; 4 not an LV/MV pin (other layout). */
++static unsigned
++wl17_clk_state(const struct wl17_gpio *g, unsigned owner)
++{
++	if ((g->en & 0x80) && (g->mode & 3) == 1 && (g->func & 0xf) == 2) { return 0xff; }
++	if (owner) { return 3; }
++	if (g->sub < 0x10 || g->sub > 0x13) { return 4; }
++	return 0;
++}
++
++static void
++wl17_errword(uint32_t w, char *out, unsigned n)
++{
++	char a[5];
++	for (unsigned i = 0; i < 4; i++) {
++		unsigned c = (w >> (8*i)) & 255;
++		a[i] = c >= 0x20 && c < 0x7f ? (char)c : '.';
++	}
++	a[4] = 0;
++	const char *k = w == 0 ? "zero" : w == ~0u ? "all-ones (read fault or no link)" :
++	    (w >> 16) == 0xcafe ? "0xcafe-prefixed sentinel word" :
++	    (w >> 16) == 0xdead ? "0xdead-prefixed sentinel word" : "plain value";
++	snprintf(out, n, "%#010x hi16 %#x lo16 %#x bytes(LE) '%s' class: %s", w, w >> 16, w & 0xffff, a, k);
++}
++
++/* Text runs of a RAM dump that look like a firmware assert/fatal message. */
++static bool wl17_print(uint8_t c) { return c >= 0x20 && c < 0x7f; }
++static bool
++wl17_error_text(const uint8_t *t, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) { if (t[i] == '%') { return false; } }
++	for (unsigned i = 0; i + 3 < n; i++) {
++		if (t[i] == '.' && t[i+1] == 'c' && t[i+2] == ':' && t[i+3] >= '0' && t[i+3] <= '9') { return true; }
++		if (i + 5 <= n && (!memcmp(t+i, "ssert", 5) || !memcmp(t+i, "SSERT", 5) || !memcmp(t+i, "FATAL", 5))) { return true; }
++		if (i + 8 <= n && !memcmp(t+i, "rr_fatal", 8)) { return true; }
++	}
++	return false;
++}
++
++typedef void (*wl17_emit)(uint64_t off, const char *text);
++static unsigned
++wl17_scan(const uint8_t *seg, uint64_t size, unsigned max, wl17_emit emit)
++{
++	unsigned found = 0; uint32_t seen[40] = {0};
++	for (uint64_t i = 0; i < size && found < max && found < 40;) {
++		if (!wl17_print(seg[i])) { i++; continue; }
++		uint64_t j = i;
++		while (j < size && wl17_print(seg[j]) && j - i < 200) { j++; }
++		unsigned n = (unsigned)(j - i);
++		if (n >= 10 && wl17_error_text(seg+i, n)) {
++			uint32_t h = 2166136261u; bool dup = false;
++			for (unsigned k = 0; k < n; k++) { h = (h ^ seg[i+k]) * 16777619u; }
++			for (unsigned k = 0; k < found; k++) { if (seen[k] == h) { dup = true; } }
++			if (!dup) {
++				char body[85]; unsigned len = n < 84 ? n : 84;
++				memcpy(body, seg+i, len); body[len] = 0;
++				seen[found++] = h; emit(i, body);
++			}
++		}
++		i = j;
++	}
++	return found;
++}
++/* ---- end P17 pure helpers ---- */
++
 +/* W12/W13 allocate after an accepted REQUEST_MEM; retain partial allocations until
 + * containment is proven. Limit includes XNU page rounding, not just wire sizes. */
 +#define WL13_CHUNK_LIMIT (2u * 1024u * 1024u)
@@ -902,14 +1032,27 @@
 +	(void)PE_parse_boot_argn("fuxiwlankeep", &keep, sizeof(keep));
 +	(void)PE_parse_boot_argn("fuxiwlanqrtr", &qrtr, sizeof(qrtr));
 +	wl_w15 = qrtr == 5; wl_w14 = qrtr == 4 || wl_w15; wl_w13 = qrtr == 3 || wl_w14; wl_w12 = qrtr == 2 || wl_w13; wl_qrtr = qrtr == 1 || wl_w12; wl_w11_attempted = wl_w11_ok = false;
-+	wl12_mlo_variant = 0;
-+	if (wl_w12) {
++	wl12_mlo_variant = 0; wl17_bits = 0;
++	{
 +		int variant = 0;
-+		(void)PE_parse_boot_argn("fuxiwlanmlo", &variant, sizeof(variant));
-+		if (variant < 0 || variant > 2) { wl_variant_invalid = true; }
-+		else { wl12_mlo_variant = (unsigned)variant; }
-+		if (variant) {
-+			printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid);
++		bool present = PE_parse_boot_argn("fuxiwlanmlo", &variant, sizeof(variant));
++		bool bad = variant < 0 || variant > (int)(WL17_MASK | 3) || (variant & 3) == 3 ||
++		    ((variant & WL17_MLOALL) && (variant & 3) == 2) || ((variant & WL17_PHY17) && (variant & 3) != 1);
++		/* Before W12 only the non-QMI P17 bits apply; the legacy selector stays ignored. */
++		if (present && (wl_w12 || (variant > 0 && (variant & WL17_MASK)))) {
++			if (bad) { wl_variant_invalid = true; }
++			else {
++				wl17_bits = (unsigned)variant & WL17_MASK;
++				if (wl_w12) { wl12_mlo_variant = (unsigned)variant & 3; }
++			}
++			if (!wl17_bits && !bad) {
++				if (variant) { printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) valid %u\n", variant, !wl_variant_invalid); }
++			} else {
++				printf("FUXI WLAN: W12 mlo variant %d (1 PHY_CAP, 2 omit MLO) P17 bits %#x (hostmem %u mloall %u phy17 %u dmaalign %u clkcheck %u clkon %u errdec %u) valid %u\n",
++				    variant, wl17_bits, !!(wl17_bits & WL17_HOSTMEM), !!(wl17_bits & WL17_MLOALL), !!(wl17_bits & WL17_PHY17),
++				    !!(wl17_bits & WL17_DMAALIGN), !!(wl17_bits & WL17_CLKCHECK), !!(wl17_bits & WL17_CLKON),
++				    !!(wl17_bits & WL17_ERRDEC), !wl_variant_invalid);
++			}
 +		}
 +	}
 +	wl15_variant = 0;
@@ -1156,6 +1299,14 @@
 +wl_dma_alloc(struct wl_dma *d, vm_size_t bytes)
 +{
 +	d->size = round_page(bytes);
++	if ((wl17_bits & WL17_DMAALIGN) && d != &wl_tables && bytes && d->size >= bytes) {
++		uint64_t align = wl17_align(d->size), next = (wl_iova_next + align - 1) & ~(align - 1);
++		if (next >= wl_iova_next && next < wl_iova_end) {
++			printf("FUXI WLAN: P17 dma align size %#llx align %#llx IOVA %#llx -> %#llx\n",
++			    (uint64_t)d->size, align, wl_iova_next, next);
++			wl_iova_next = next;
++		}
++	}
 +	if (!bytes || d->size < bytes || wl_iova_next < wl_iova_base ||
 +	    wl_iova_next >= wl_iova_end || d->size > wl_iova_end - wl_iova_next) { return 1; }
 +	kern_return_t kr = kmem_alloc(kernel_map, &d->va, d->size,
@@ -3690,6 +3841,9 @@
 +			else if (bit == 2) { num = p[off]; }
 +			else if (bit == 4) { board = wl_get32(p+off); }
 +			else { support = p[off]; }
++		} else if (type == 0x17 && (wl17_bits & WL17_PHY17)) {
++			wl17_phy17_parse(p+off, n);
++			printf("FUXI WLAN: P17 phy cap TLV 0x17 len %u value %#llx\n", wl17_phy17_len, wl17_phy17_val);
 +		} else { printf("FUXI WLAN: W12 phy cap unknown TLV %#x bytes %u\n", type, n); }
 +		off += n;
 +	}
@@ -3722,11 +3876,13 @@
 +	    wl12_tlv(e, 0x14, 1, 1) || wl12_tlv(e, 0x16, 1, 1) ||
 +	    wl12_tlv(e, 0x17, 1, 1) || wl12_tlv(e, 0x1a, 0, 1) ||
 +	    wl12_tlv(e, 0x1c, 0, 1)) { return 1; }
-+	bool mlo = wl12_mlo_variant != 2 && wl12_mlo_enabled && wl12_num_phy && wl12_num_phy != 255;
++	int links = wl17_mlo_links(wl12_mlo_variant, wl17_bits, wl12_mlo_enabled, wl12_num_phy);
++	bool mlo = links != 0;
 +	if (mlo) {
 +		/* Upstream's arrays hold TWO links. Refuse unsupported counts
-+		 * instead of reproducing its unchecked array writes for 3..254. */
-+		if (wl12_num_phy > 2) { return wl_w11_fail("PHY_CAP num_phy exceeds two-link EI capacity"); }
++		 * instead of reproducing its unchecked array writes for 3..254
++		 * (P17 MLOALL clamps to two instead). */
++		if (links < 0) { return wl_w11_fail("PHY_CAP num_phy exceeds two-link EI capacity"); }
 +		if (wl12_tlv(e, 0x21, 1, 1) || wl12_tlv(e, 0x22, 0, 2) ||
 +		    wl12_tlv(e, 0x23, 0, 1) || wl12_tlv(e, 0x24, 32, 2) ||
 +		    wl12_tlv(e, 0x25, 1, 1)) { return 1; }
@@ -3734,14 +3890,19 @@
 +		 * hw_link_id[2], valid_mlo_link_id[2]. No count/valid prefixes. */
 +		if (e->len > sizeof(e->data)-21) { return wl_w11_fail("HOST_CAP MLO bounds"); }
 +		e->data[e->len++] = 0x26; wl_put16(e->data+e->len, 18); e->len += 2;
-+		uint8_t info[18] = {0}; info[1] = wl12_num_phy;
-+		for (unsigned i = 0; i < wl12_num_phy; i++) { info[2+i] = i; info[4+i] = 1; }
++		uint8_t info[18] = {0}; info[1] = (uint8_t)links;
++		for (int i = 0; i < links; i++) { info[2+i] = (uint8_t)i; info[4+i] = 1; }
 +		memcpy(e->data+e->len, info, sizeof(info)); e->len += sizeof(info);
 +	}
-+	if (wl12_mlo_variant) {
++	if (wl12_mlo_variant || wl17_bits) {
 +		printf("FUXI WLAN: W12 host cap MLO TLVs %s num_phy %u\n", mlo ? "present" : "omitted", wl12_num_phy);
 +	}
-+	return wl12_tlv(e, 0x27, 0x18, 8);
++	if (wl12_tlv(e, 0x27, 0x18, 8)) { return 1; }
++	if (wl17_bits & WL17_HOSTMEM) {
++		printf("FUXI WLAN: P17 host cap vendor TLV 0x33 host-memory-on-demand = 1 appended after 0x27\n");
++		return wl12_tlv(e, 0x33, 1, 1);
++	}
++	return 0;
 +}
 +
 +/* W15 variable arrays: one u8 count followed by explicitly LE u32 fields.
@@ -4073,6 +4234,52 @@
 +	return 0;
 +}
 +
++/* P17 ERRDEC: classify the BHI error words (raw values stay in the line
++ * above) and, when the device is in RDDM and the RX sink exists, scan the
++ * uploaded dump for firmware assert text. Reads only; no dump is requested. */
++static void
++wl17_emit_hit(uint64_t off, const char *text)
++{
++	printf("FUXI WLAN: P17 rddm text +%#llx: %s\n", off, text);
++}
++
++static void
++wl17_rddm_scan(void)
++{
++	if (!wl_rddm.va || !wl_bhie || wl_rddm.size < WL_RDDM_SIZE) {
++		printf("FUXI WLAN: P17 rddm scan unavailable (no RX sink; needs fuxiwlanvec=rddm)\n"); return;
++	}
++	uint32_t st = 0; unsigned waited = 0, before = fw_faults;
++	for (; waited < 100; waited++) {
++		st = wl_mrd(wl_bhie+0x78);
++		if (fw_faults != before || (st >> 30) >= 2) { break; }
++		wl_sleep(10);
++	}
++	printf("FUXI WLAN: P17 rddm upload RXVECSTATUS %#x after %u ms faults %u\n", st, waited*10, fw_faults-before);
++	if (fw_faults != before || (st >> 30) != 2) { return; }
++	wl_dma_civac(&wl_rddm);
++	const uint8_t *seg = (const uint8_t *)wl_rddm.va;
++	unsigned found = wl17_scan(seg, WL_RDDM_SIZE, 40, wl17_emit_hit);
++	printf("FUXI WLAN: P17 rddm scan %u bytes %u messages\n", WL_RDDM_SIZE, found);
++	for (unsigned o = 0; o < 0x80; o += 32) {
++		uint32_t w[8]; memcpy(w, seg+o, 32);
++		printf("FUXI WLAN: P17 rddm-rec %03x: %08x %08x %08x %08x %08x %08x %08x %08x\n", o, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++	}
++}
++
++static void
++wl17_errdec(const char *label, uint32_t ee, uint32_t code, uint32_t d1, uint32_t d2, uint32_t d3)
++{
++	const char *names[4] = {"ERRCODE", "ERRDBG1", "ERRDBG2", "ERRDBG3"};
++	uint32_t w[4] = {code, d1, d2, d3};
++	char text[160];
++	for (unsigned i = 0; i < 4; i++) {
++		wl17_errword(w[i], text, sizeof(text));
++		printf("FUXI WLAN: P17 %s %s %s\n", label, names[i], text);
++	}
++	if (ee == 3 && !fw_faults) { wl17_rddm_scan(); }
++}
++
 +/* Snapshot only: six fault-contained reads before STOP/reset can change the
 + * evidence. RDDM EE=3; MHISTATUS SYSERR is bit 2, MHI state is bits 15:8
 + * (SYS_ERR=0xff). Never arm/read a crash dump or initiate a large transfer. */
@@ -4089,6 +4296,7 @@
 +	if (ee == 3 && !fw_faults) {
 +		printf("FUXI WLAN: %s RDDM observed; dump not collected; contain\n", wl_w15 && wl12_stage >= WL15_INI ? "W15" : "W13");
 +	}
++	if ((wl17_bits & WL17_ERRDEC) && !fw_faults) { wl17_errdec(label, ee, code, d1, d2, d3); }
 +}
 +
 +static void
@@ -4912,6 +5120,105 @@
 +	}
 +}
 +
++/* P17 CLKCHECK / CLKON: PMK8550 gpio3 (32 kHz sleep clock) over SPMI arbiter
++ * v7, EE 0 (map as fuxi_keys.c; layout as docs-lanes/buttons.md). CLKCHECK is
++ * observer reads only. CLKON writes the five registers of wl17_clk_writes on
++ * the pin's own channel, only if EE 0 owns the APID and the pin is not an
++ * enabled function-2 output. Volatile PMIC state; failures never stop the run. */
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++#define WL17_SP_CORE 0x0c400000u
++#define WL17_SP_CNFG 0x0c42d000u
++#define WL17_SP_OBS 0x0c440000u
++#define WL17_SP_CHN 0x0c500000u
++
++static uint32_t
++wl17_sp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static bool
++wl17_sp_read(vm_offset_t obs, uint32_t apid, uint8_t reg, uint8_t *out)
++{
++	uint32_t off = 0x20u * apid;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(obs + off) = (1u << 27) | ((uint32_t)reg << 4); /* EXT_READL, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = wl17_sp_rd(obs, off + 8);
++		if (st & 1u) {
++			if (st & 0x0eu) { return false; }
++			*out = (uint8_t)wl17_sp_rd(obs, off + 0x18);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++wl17_sp_write(vm_offset_t chn, uint8_t reg, uint8_t val)
++{
++	*(volatile uint32_t *)(chn + 0x10) = val; /* WDATA0 */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(chn + 0) = (uint32_t)reg << 4; /* EXT_WRITEL */
++	__asm__ volatile("dsb osh" ::: "memory");
++	for (unsigned i = 0; i < 1000; i++) {
++		uint32_t st = wl17_sp_rd(chn, 8);
++		if (st & 1u) { return (st & 0x0eu) == 0; }
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++wl17_clk_read(vm_offset_t obs, uint32_t apid, struct wl17_gpio *g)
++{
++	return wl17_sp_read(obs, apid, 0x04, &g->type) && wl17_sp_read(obs, apid, 0x05, &g->sub) &&
++	    wl17_sp_read(obs, apid, 0x40, &g->mode) && wl17_sp_read(obs, apid, 0x44, &g->func) &&
++	    wl17_sp_read(obs, apid, 0x46, &g->en);
++}
++
++static void
++wl17_clk_step(void)
++{
++	if (!(wl17_bits & (WL17_CLKCHECK | WL17_CLKON))) { return; }
++	vm_offset_t core = ml_io_map(WL17_SP_CORE, 0x3000), cnfg = ml_io_map(WL17_SP_CNFG, 0x1000);
++	vm_offset_t obs = ml_io_map(WL17_SP_OBS, 0x8000);
++	if (!core || !cnfg || !obs) { printf("FUXI WLAN: P17 sleepclk SPMI mapping failed\n"); return; }
++	uint32_t ver = wl17_sp_rd(core, 0), count = wl17_sp_rd(core, 4) & 0x7ffu;
++	if (ver < 0x70000000u || ver >= 0x80000000u || !count || count > 1024) {
++		printf("FUXI WLAN: P17 sleepclk unsupported SPMI arb=%#x APIDs=%u; skipped\n", ver, count); return;
++	}
++	uint32_t apid = ~0u; unsigned owner = 7;
++	sweet_spmi_bus_lock();
++	for (uint32_t i = 0; i < count; i++) {
++		uint32_t map = wl17_sp_rd(core, 0x2000u + 4u*i);
++		if (!map || ((map >> 8) & 0xfffu) != WL17_CLK_PPID) { continue; }
++		unsigned o = wl17_sp_rd(cnfg, 4u*i) & 7u;
++		if (apid == ~0u || o == 0) { apid = i; owner = o; }
++	}
++	struct wl17_gpio g = {0};
++	bool ok = apid != ~0u && wl17_clk_read(obs, apid, &g);
++	unsigned state = ok ? wl17_clk_state(&g, owner) : 0xfe;
++	printf("FUXI WLAN: P17 sleepclk pmk8550 gpio3 ppid %#x apid %d owner ee%u read %u type %#x sub %#x mode %#x func %#x en %#x state %#x (0xff on, 0 off, 3 not ours, 4 layout, 0xfe unreadable)\n",
++	    WL17_CLK_PPID, apid == ~0u ? -1 : (int)apid, owner, ok, g.type, g.sub, g.mode, g.func, g.en, state);
++	if (ok && state == 0 && (wl17_bits & WL17_CLKON)) {
++		vm_offset_t chn = ml_io_map(WL17_SP_CHN + 0x1000u*apid, 0x1000);
++		bool wok = chn != 0;
++		for (unsigned i = 0; wok && i < 5; i++) { wok = wl17_sp_write(chn, wl17_clk_writes[i].reg, wl17_clk_writes[i].val); }
++		struct wl17_gpio a = {0};
++		bool aok = wl17_clk_read(obs, apid, &a);
++		printf("FUXI WLAN: P17 sleepclk enable writes ok %u after: read %u mode %#x func %#x en %#x state %#x\n",
++		    wok, aok, a.mode, a.func, a.en, aok ? wl17_clk_state(&a, owner) : 0xfe);
++	} else if (wl17_bits & WL17_CLKON) {
++		printf("FUXI WLAN: P17 sleepclk enable skipped (state %#x)\n", state);
++	}
++	sweet_spmi_bus_unlock();
++}
++
 +static void
 +fw_run(unsigned limit)
 +{
@@ -4924,6 +5231,7 @@
 +		unsigned faults0 = fw_faults;
 +		int e;
 +		if (s <= WL3_STEPS) {
++			if (s == 1) { wl17_clk_step(); } /* P17 opt-in sleep clock, before any WLAN power writes */
 +			e = s == 1 ? wl_cnss_pdc() : 0; /* before any WLAN power writes */
 +			if (s == 1 && e) {
 +				printf("FUXI WLAN: M6n PDC blocked before WLAN power, consumed %u/13 reason %u; reboot to retry\n",
@@ -5037,7 +5345,6 @@
 +	}
 +}
 +#endif /* FUXI */
-
 --- a/bsd/dev/wlan.c
 +++ b/bsd/dev/wlan.c
 @@ -0,0 +1,551 @@

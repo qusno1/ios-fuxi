@@ -63,7 +63,8 @@ def main():
         ordered.append(patch)
     ordered += [ROOT/'tools/patches/mesa-fuxi-smoke.patch',
                 ROOT/'tools/patches/mesa-fuxi-hostimport.patch',
-                ROOT/'tools/patches/mesa-fuxi-ir3-round-default.patch']
+                ROOT/'tools/patches/mesa-fuxi-ir3-round-default.patch',
+                ROOT/'tools/patches/mesa-fuxi-fence-wait-100ms.patch']
     # Accept only an exact prefix of this stack, including a completed cache.
     # Reverse-checking an upstream added file fails after a local overlay.
     with tempfile.TemporaryDirectory() as tmp:

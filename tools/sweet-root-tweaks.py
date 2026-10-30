@@ -63,6 +63,28 @@ Opt-in steps (off unless named; docs-lanes/wallpaper.md has the evidence):
                         image caches. Preferred on this GPU-less system: the
                         static image stayed white on device even when light
   --no-legacy-wallpaper-color  remove that colour again
+  --oslog LABEL[,LABEL...]
+                        diagnostic: OS_ACTIVITY_DT_MODE=YES for these launchd
+                        job labels (e.g. com.apple.chronod,com.apple.lsd,
+                        com.apple.pluginkit.pkd); add the process names to the
+                        sweetnull boot-arg to see the lines
+  --rebuild-launchservices
+                        delete the LaunchServices databases (lsd rebuilds them
+                        at the next boot) and chronod's cached widget
+                        snapshots. The database on the root was built before
+                        the kernel answered AMFI request 0x60, so it holds no
+                        extension point and no app extension: chronod and
+                        PosterBoard find no widget or poster extension
+  --install-staged-apps
+                        move the removable system apps that iOS installs on
+                        its first boot (/private/var/staged_system_apps:
+                        Weather, Calendar, Maps, Notes, ...) to /Applications,
+                        park their /System/Library/AppPlaceholders stubs and
+                        add their extensions to the launchd.plist cache
+                        (AppExtensions). The data migration that would install
+                        them is skipped on this root. Use with
+                        --rebuild-launchservices
+  --no-install-staged-apps  undo --install-staged-apps
   --only-optional       apply just the named opt-in steps, not the base set
 """
 import argparse, glob, os, plistlib, shutil, struct, sys, zlib
@@ -90,6 +112,57 @@ def merge_pref(root, name, values):
     data.update(values)
     save(path, data, MOBILE, MOBILE, 0o600)
     print('pref', name, sorted(values))
+
+
+AX_PREF = 'com.apple.Accessibility'
+AX_REDUCE_TRANSPARENCY = 'EnhancedBackgroundContrastEnabled'
+
+
+def reduce_transparency(root, enable, owner=(MOBILE, MOBILE)):
+    """Settings > Accessibility > Reduce Transparency: solid fills in place of
+    the blur materials behind widgets, the dock and folders (fewer GPU passes
+    and CPU-encoded draws per compositor frame)."""
+    path = os.path.join(root, 'private/var/mobile/Library/Preferences', AX_PREF + '.plist')
+    data = load(path) if os.path.exists(path) else {}
+    if enable:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        data[AX_REDUCE_TRANSPARENCY] = True
+    elif data.pop(AX_REDUCE_TRANSPARENCY, None) is None:
+        print('pref', AX_PREF, 'reduce transparency already off')
+        return
+    save(path, data, owner[0], owner[1], 0o600)
+    print('pref', AX_PREF, 'reduce transparency', 'on' if enable else 'off')
+
+
+MG_CACHE = 'private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist'
+# Aixt/MEN2O2B7f+8m4TxUA is the deep colour answer MaterialKit, QuartzCore and
+# UIKit read (MTSupportsDeepColor). True makes MaterialKit snapshot idle materials
+# (App Library, Today view) into two-plane 10-bit 'b3a8' surfaces that the Fuxi GPU
+# path cannot render, so they stay black; the panel scans out 8-bit BGRA anyway.
+MG_DEEP_COLOR = 'Aixt/MEN2O2B7f+8m4TxUA'
+
+
+def mg_cache_extra(root, specs):
+    """Override MobileGestalt answers in the cache's CacheExtra (KEY=true|false).
+    The cache is written by MobileGestalt itself; an absent cache is left absent."""
+    values = {}
+    for spec in specs:
+        key, sep, value = spec.partition('=')
+        if not key or not sep or value not in ('true', 'false'):
+            sys.exit('bad --mg-cache-extra %r (KEY=true|false)' % spec)
+        values[key] = value == 'true'
+    path = os.path.join(root, MG_CACHE)
+    if not os.path.exists(path):
+        print('mobilegestalt cache: absent, nothing changed')
+        return False
+    st = os.stat(path)
+    data = load(path)
+    extra = data.setdefault('CacheExtra', {})
+    for key, value in sorted(values.items()):
+        print('mobilegestalt cache:', key, extra.get(key, '<unset>'), '->', value)
+        extra[key] = value
+    save(path, data, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    return True
 
 
 def launchd(root):
@@ -177,6 +250,193 @@ def posterboard_oslog(root):
     job.setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
     save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
     print('launchd.plist: PosterBoard OS_ACTIVITY_DT_MODE=YES')
+
+
+def oslog_jobs(root, labels):
+    """OS_ACTIVITY_DT_MODE=YES for the cached launchd jobs with these labels."""
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    by_label = {j.get('Label'): j for j in plist['LaunchDaemons'].values()}
+    missing = [label for label in labels if label not in by_label]
+    if missing:
+        sys.exit('launchd.plist: no job labelled ' + ', '.join(missing))
+    for label in labels:
+        by_label[label].setdefault('EnvironmentVariables', {})['OS_ACTIVITY_DT_MODE'] = 'YES'
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print('launchd.plist: OS_ACTIVITY_DT_MODE=YES for', ', '.join(labels))
+
+
+def job_env(root, specs):
+    """LABEL:KEY=VALUE sets one environment variable on a cached launchd job
+    (e.g. TU_DEBUG for backboardd); LABEL:KEY= removes it."""
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    by_label = {j.get('Label'): j for j in plist['LaunchDaemons'].values()}
+    changes = []
+    for spec in specs:
+        label, sep, assignment = spec.partition(':')
+        key, eq, value = assignment.partition('=')
+        if not (sep and eq and label and key):
+            sys.exit('--job-env expects LABEL:KEY=VALUE, got ' + spec)
+        if label not in by_label:
+            sys.exit('launchd.plist: no job labelled ' + label)
+        changes.append((by_label[label], key, value))
+    for job, key, value in changes:
+        env = job.setdefault('EnvironmentVariables', {})
+        if value:
+            env[key] = value
+        else:
+            env.pop(key, None)
+            if not env:
+                del job['EnvironmentVariables']
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    print('launchd.plist: env', ', '.join(specs))
+
+
+LS_DATABASES = 'private/var/mobile/Containers/Data/InternalDaemon/*/Library/Caches/*com.apple.LaunchServices-*.csstore'
+CHRONO_SNAPSHOTS = 'private/var/mobile/Library/Caches/com.apple.chrono/snapshot-cache'
+
+
+def rebuild_launchservices(root):
+    """lsd rebuilds a missing database from the system app directories and
+    asks installd for containerized content. The old one, built while AMFI
+    request 0x60 failed, has no extension points (no com.apple.widgetkit-
+    extension or com.apple.posterkit.provider records); chronod's cached
+    snapshots are empty black placeholders of the never-run extensions."""
+    removed = 0
+    for path in glob.glob(os.path.join(root, LS_DATABASES)):
+        os.remove(path)
+        removed += 1
+    snapshots = 0
+    cache = os.path.join(root, CHRONO_SNAPSHOTS)
+    if os.path.isdir(cache):
+        for entry in os.listdir(cache):
+            shutil.rmtree(os.path.join(cache, entry))
+            snapshots += 1
+    print(f'LaunchServices: {removed} database(s) removed; chrono: {snapshots} snapshot dir(s) removed')
+
+
+STAGED_APPS = 'private/var/staged_system_apps'
+PLACEHOLDERS = 'System/Library/AppPlaceholders'
+PARKED_PLACEHOLDERS = 'System/Library/AppPlaceholders.fuxi-staged'
+STAGED_MANIFEST = '.fuxi-installed-staged-apps.plist'
+EXTENSION_DIRS = ('PlugIns', 'Extensions')
+# Info.plist keys that launchd.plist's AppExtensions cache leaves out. This
+# reproduces all 129 cached /Applications/*/PlugIns entries of 20H392 exactly.
+CACHE_DROPPED_KEYS = {
+    'BuildMachineOSBuild', 'CFBundleDevelopmentRegion', 'CFBundleDisplayName',
+    'CFBundleInfoDictionaryVersion', 'CFBundleShortVersionString', 'CFBundleSignature',
+    'CFBundleSupportedPlatforms', 'MinimumOSVersion', 'NSHumanReadableCopyright',
+    'UIApplicationShowsViewsWhileLocked', 'UIDeviceFamily', 'UIRequiredDeviceCapabilities'}
+CACHE_DROPPED_PREFIXES = ('DT', 'CFBundleIcons', 'UISupportedInterfaceOrientations')
+
+
+def extension_cache_entry(bundle_path, info):
+    kept = {k: v for k, v in info.items()
+            if k not in CACHE_DROPPED_KEYS and not k.startswith(CACHE_DROPPED_PREFIXES)}
+    return {'_executablePath': bundle_path + '/' + info['CFBundleExecutable'], '_infoPlist': kept}
+
+
+def app_extensions(root, app_path):
+    """(cache key, cache entry) for the extensions of /Applications/NAME.app."""
+    for sub in EXTENSION_DIRS:
+        for appex in sorted(glob.glob(os.path.join(root, app_path.lstrip('/'), sub, '*.appex'))):
+            info = os.path.join(appex, 'Info.plist')
+            if not os.path.isfile(info):
+                continue
+            data = load(info)
+            if 'CFBundleExecutable' not in data:
+                continue
+            key = app_path + '/' + sub + '/' + os.path.basename(appex)
+            yield key, extension_cache_entry(key, data)
+
+
+def placeholders_by_id(root):
+    found = {}
+    for app in glob.glob(os.path.join(root, PLACEHOLDERS, '*.app')):
+        info = os.path.join(app, 'Info.plist')
+        if os.path.isfile(info):
+            found[load(info).get('CFBundleIdentifier')] = app
+    return found
+
+
+def install_staged_apps(root):
+    """What HackiOS does for the same 16.x images: the staged apps become
+    plain system apps in /Applications. Without this their placeholders are
+    what LaunchServices knows ("Waiting..." labels) and the default widgets
+    (Weather, Calendar, Maps, Notes, Stocks, Tips) have no extension to run."""
+    staged = os.path.join(root, STAGED_APPS)
+    parked = os.path.join(root, PARKED_PLACEHOLDERS)
+    manifest_path = os.path.join(parked, STAGED_MANIFEST)
+    manifest = load(manifest_path) if os.path.exists(manifest_path) else []
+    done = {e['name'] for e in manifest}
+    placeholders = placeholders_by_id(root)
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    cache = plist.setdefault('AppExtensions', {})
+    moved = skipped = extensions = 0
+    for app in sorted(glob.glob(os.path.join(staged, '*.app'))):
+        name = os.path.basename(app)
+        dest = os.path.join(root, 'Applications', name)
+        info = os.path.join(app, 'Info.plist')
+        if os.path.exists(dest) or not os.path.isfile(info):
+            print('staged app skipped (exists in /Applications or no Info.plist):', name)
+            skipped += 1
+            continue
+        bundle_id = load(info).get('CFBundleIdentifier')
+        os.rename(app, dest)
+        entry = {'name': name, 'bundleIdentifier': bundle_id, 'placeholder': ''}
+        placeholder = placeholders.get(bundle_id)
+        if placeholder:
+            os.makedirs(parked, mode=0o755, exist_ok=True)
+            os.rename(placeholder, os.path.join(parked, os.path.basename(placeholder)))
+            entry['placeholder'] = os.path.basename(placeholder)
+        for key, value in app_extensions(root, '/Applications/' + name):
+            cache[key] = value
+            extensions += 1
+        if name not in done:
+            manifest.append(entry)
+        moved += 1
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    if manifest:
+        os.makedirs(parked, mode=0o755, exist_ok=True)
+        save(manifest_path, manifest, st.st_uid, st.st_gid, 0o644, plistlib.FMT_XML)
+    print(f'staged apps: {moved} moved to /Applications, {skipped} skipped, '
+          f'{extensions} extension(s) added to the launchd.plist cache')
+
+
+def uninstall_staged_apps(root):
+    parked = os.path.join(root, PARKED_PLACEHOLDERS)
+    manifest_path = os.path.join(parked, STAGED_MANIFEST)
+    if not os.path.exists(manifest_path):
+        print('staged apps: nothing to undo')
+        return
+    path = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    st = os.stat(path)
+    plist = load(path)
+    cache = plist.get('AppExtensions', {})
+    restored = 0
+    for entry in load(manifest_path):
+        name = entry['name']
+        prefix = '/Applications/' + name + '/'
+        for key in [k for k in cache if k.startswith(prefix)]:
+            del cache[key]
+        src = os.path.join(root, 'Applications', name)
+        if os.path.isdir(src):
+            os.rename(src, os.path.join(root, STAGED_APPS, name))
+            restored += 1
+        if entry.get('placeholder'):
+            p = os.path.join(parked, entry['placeholder'])
+            if os.path.isdir(p):
+                os.rename(p, os.path.join(root, PLACEHOLDERS, entry['placeholder']))
+    save(path, plist, st.st_uid, st.st_gid, st.st_mode & 0o7777)
+    os.remove(manifest_path)
+    if not os.listdir(parked):
+        os.rmdir(parked)
+    print(f'staged apps: {restored} moved back to {STAGED_APPS}')
 
 
 def legacy_wallpaper(root, enable):
@@ -443,6 +703,16 @@ def main():
     image.add_argument('--no-legacy-wallpaper-image', action='store_true')
     image.add_argument('--legacy-wallpaper-color', nargs='?', const=WALLPAPER_COLOR, metavar='#RRGGBB')
     image.add_argument('--no-legacy-wallpaper-color', action='store_true')
+    ap.add_argument('--oslog', metavar='LABEL[,LABEL...]')
+    ap.add_argument('--job-env', action='append', metavar='LABEL:KEY=VALUE')
+    ap.add_argument('--rebuild-launchservices', action='store_true')
+    ap.add_argument('--mg-cache-extra', action='append', metavar='KEY=true|false')
+    staged = ap.add_mutually_exclusive_group()
+    staged.add_argument('--install-staged-apps', action='store_true')
+    staged.add_argument('--no-install-staged-apps', action='store_true')
+    transparency = ap.add_mutually_exclusive_group()
+    transparency.add_argument('--reduce-transparency', action='store_true')
+    transparency.add_argument('--no-reduce-transparency', action='store_true')
     ap.add_argument('--only-optional', action='store_true')
     args = ap.parse_args()
     root = args.root
@@ -450,6 +720,20 @@ def main():
         ap.error('not a mounted iOS root: ' + root)
     if args.posterboard_oslog:
         posterboard_oslog(root)
+    if args.oslog:
+        oslog_jobs(root, [label for label in args.oslog.split(',') if label])
+    if args.job_env:
+        job_env(root, args.job_env)
+    if args.mg_cache_extra:
+        mg_cache_extra(root, args.mg_cache_extra)
+    if args.install_staged_apps:
+        install_staged_apps(root)
+    if args.no_install_staged_apps:
+        uninstall_staged_apps(root)
+    if args.rebuild_launchservices:
+        rebuild_launchservices(root)
+    if args.reduce_transparency or args.no_reduce_transparency:
+        reduce_transparency(root, args.reduce_transparency)
     if args.legacy_wallpaper or args.no_legacy_wallpaper:
         legacy_wallpaper(root, args.legacy_wallpaper)
     if args.legacy_wallpaper_image:

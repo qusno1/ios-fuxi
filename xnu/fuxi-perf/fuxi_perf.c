@@ -64,6 +64,13 @@ static unsigned fp_duty_count;
 static int fp_prev_temp, fp_prev_valid, fp_blocked;
 static uint64_t fp_rate_elapsed;
 static int fp_rate_temp, fp_rate_valid, fp_rate;
+static unsigned fp_pressure_enabled;
+static int fp_pressure = -1; /* No fabricated nominal before the first sample. */
+static uint64_t fp_pressure_since, fp_pressure_dwell; /* fall hold, 10 s */
+/* Actual (LMh-limited) EPSS domain state +0x20, L x 19.2 MHz, sampled per
+ * worker tick. [0] while boosted, [1] otherwise; gold and prime only. */
+static uint64_t fp_cur_sum[2][2], fp_cur_n[2];
+static unsigned fp_cur_max[2][2];
 static unsigned fp_enabled, fp_started, fp_ready;
 static thread_call_data_t fp_call;
 /* Refusals are EBUSY, never EAGAIN: userland_sysctl() retries a handler's
@@ -234,6 +241,22 @@ static int fp_compile_sysctl SYSCTL_HANDLER_ARGS
 SYSCTL_PROC(_kern, OID_AUTO, fuxicompileboost,
     CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     0, 0, fp_compile_sysctl, "S,fuxi_compile_reply", "platform backboardd current-thread compile lease");
+static int fp_pressure_sysctl SYSCTL_HANDLER_ARGS
+{
+ /* Reads never run the worker or touch MMIO. The lock snapshots readiness
+  * and pressure together; SYSCTL_OUT runs after dropping it. */
+ if (req->newptr) return EPERM;
+ if (!__atomic_load_n(&fp_enabled,__ATOMIC_ACQUIRE)) return ENOTSUP;
+ lck_mtx_lock(&fp_lock);
+ int level = fp_pressure, enabled = fp_pressure_enabled;
+ lck_mtx_unlock(&fp_lock);
+ if (!enabled) return ENOTSUP;
+ if (level < 0) return EBUSY;
+ return SYSCTL_OUT(req,&level,sizeof(level));
+}
+SYSCTL_PROC(_kern, OID_AUTO, fuxipressure,
+    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, fp_pressure_sysctl, "I", "OSThermalPressureLevel (fuxiperf=1 fuxitp=1)");
 static int fp_read(uintptr_t base, unsigned off, uint32_t *value)
 {
  uint64_t v = 0;
@@ -510,6 +533,7 @@ static void fp_configure(void)
  if (fp_hot > fp_limit) fp_hot = fp_limit;
  fp_arg("fuxiperfresume",&fp_resume,350,fp_hot-10);
  if (fp_resume > fp_hot-10) fp_resume = fp_hot-10;
+ fp_arg("fuxiperfstart",&fp_start,400,fp_limit);
  fp_arg("fuxiperfrise",&fp_rise,10,1000);
  fp_arg("fuxiperffast",&fp_fast_ms,5,25);
  fp_arg("fuxiperfrate",&fp_rate_ms,fp_fast_ms,1000);
@@ -517,8 +541,8 @@ static void fp_configure(void)
  nanoseconds_to_absolutetime((uint64_t)fp_budget_ms*NSEC_PER_MSEC,&fp_budget);
  nanoseconds_to_absolutetime(NSEC_PER_SEC,&fp_duty_window);
  nanoseconds_to_absolutetime(500ULL*NSEC_PER_MSEC,&fp_recovery);
- printf("FUXI PERF: thermal hot %u limit %u resume %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
-     fp_hot,fp_limit,fp_resume,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
+ printf("FUXI PERF: thermal hot %u limit %u resume %u start %u dC rise %u dC/s fast %u ms slope %u ms duty %u/1000 ms recovery 500 ms predict 100 ms\n",
+     fp_hot,fp_limit,fp_resume,fp_start,fp_rise,fp_fast_ms,fp_rate_ms,fp_budget_ms);
 }
 static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result)
 {
@@ -545,6 +569,10 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
  if ((valid && temp >= (int)fp_hot) ||
      (fp_prev_valid && fp_prev_temp >= (int)fp_hot)) fp_above_time += elapsed;
  int safe = fp_thermal_guard(valid,temp,now,elapsed_ns);
+ if (fp_pressure_enabled)
+  fp_pressure = fp_pressure_hold(fp_pressure,
+      fp_pressure_level(fp_pressure,valid,temp,fp_blocked,fp_hot,fp_limit,fp_resume),
+      now,&fp_pressure_since,fp_pressure_dwell);
  uint64_t used = fp_duty_used(now);
  int duty_ok = used < fp_budget && (fp_boosted || fp_duty_count < 16);
  fp_compile_poll(now,safe,duty_ok);
@@ -583,12 +611,24 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
   fp_duty_end[fp_duty_count++] = now;
  }
  fp_boosted = boost;
+ for (unsigned d = 1; d < 3; d++) {
+  uint32_t cur;
+  if (!fp_epss[d] || fp_domain_failed[d] || !fp_read(fp_epss[d],0x20,&cur)) continue;
+  unsigned mhz = (cur & 0xff)*192/10, b = boost ? 0 : 1;
+  fp_cur_sum[b][d-1] += mhz;
+  if (d == 1) fp_cur_n[b]++;
+  if (mhz > fp_cur_max[b][d-1]) fp_cur_max[b][d-1] = mhz;
+ }
  fp_last = now;
  if (!fp_window_start) fp_window_start = now;
  if (now-fp_window_start >= fp_window) {
   uint64_t ns, above_ns;
   absolutetime_to_nanoseconds(fp_boost_time,&ns);
   absolutetime_to_nanoseconds(fp_above_time,&above_ns);
+  for (unsigned b = 0; b < 2; b++) if (fp_cur_n[b])
+   printf("FUXI PERF: freq %s gold %llu/%u prime %llu/%u MHz avg/max samples %llu\n",
+       b ? "unboosted" : "boosted",fp_cur_sum[b][0]/fp_cur_n[b],fp_cur_max[b][0],
+       fp_cur_sum[b][1]/fp_cur_n[b],fp_cur_max[b][1],fp_cur_n[b]);
   if (!fp_idle_after) printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s\n",
       fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
       valid,fp_boosted ? "high" : "cool");
@@ -598,6 +638,11 @@ static void fp_worker_locked(thread_call_param_t arg, thread_call_param_t result
    printf("FUXI PERF: stats boosts %llu boosted %llu ms max temp %d dC above %u dC %llu ms cuts %llu valid %d state %s idle %llu ms entries %llu\n",
        fp_boosts,ns/1000000,fp_max_temp,fp_hot,above_ns/1000000,fp_cuts,
        valid,idle ? "idle" : fp_boosted ? "high" : "cool",idle_ns/1000000,fp_idle_entries);
+  }
+  for (unsigned b = 0; b < 2; b++) {
+   fp_cur_n[b] = 0;
+   fp_cur_sum[b][0] = fp_cur_sum[b][1] = 0;
+   fp_cur_max[b][0] = fp_cur_max[b][1] = 0;
   }
   fp_idle_time = fp_idle_entries = 0;
   fp_boosts = fp_boost_time = fp_above_time = fp_cuts = 0;
@@ -625,6 +670,9 @@ void fuxi_perf_start(void)
  (void)PE_parse_boot_argn("fuxiperf",&enable,sizeof(enable));
  if (enable != 1 || fp_started) return;
  fp_started = 1;
+ (void)PE_parse_boot_argn("fuxitp",&fp_pressure_enabled,sizeof(fp_pressure_enabled));
+ fp_pressure_enabled = fp_pressure_enabled == 1;
+ nanoseconds_to_absolutetime(10*NSEC_PER_SEC,&fp_pressure_dwell);
  (void)PE_parse_boot_argn("fuxicompileboost",&fp_compile_enabled,sizeof(fp_compile_enabled));
  fp_compile_enabled = fp_compile_enabled == 1;
  /* Keep at least two of logical 2-6 (gold/prime); otherwise ignore. */

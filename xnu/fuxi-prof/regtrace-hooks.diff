@@ -1,0 +1,205 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -107,6 +107,7 @@
+ bsd/dev/sweet_ufs.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_prof.c			standard
++bsd/dev/fuxi_regtrace.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/fuxi_touch.c			standard
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_prof_start(void);
++extern void fuxi_regtrace_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void fuxi_touch_init(void);
+@@ -943,6 +944,9 @@
+ 	 * would write the tail of ufsroot0, which here is the HFS image itself.
+ 	 */
+ 	sweet_prof_start();
++#if defined(FUXI)
++	fuxi_regtrace_start();
++#endif
+ 	char smp[8];
+ 	if (PE_parse_boot_argn("sweetsample", smp, sizeof(smp)) && smp[0] != '-') {
+ 		sweet_sample_start();
+--- a/bsd/kern/sys_work_interval.c
++++ b/bsd/kern/sys_work_interval.c
+@@ -37,11 +37,17 @@
+ #include <kern/work_interval.h>
+ 
+ #include <libkern/libkern.h>
++#if defined(FUXI)
++#include <kern/fuxi_regtrace.h>
++#endif
+ 
+ int
+ work_interval_ctl(__unused proc_t p, struct work_interval_ctl_args *uap,
+     __unused int32_t *retval)
+ {
++#if defined(FUXI)
++	uint64_t frt_start __unused __attribute__((cleanup(fuxi_regtrace_work_end)))=fuxi_regtrace_begin();
++#endif
+ 	uint32_t        operation = uap->operation;
+ 	int             error = 0;
+ 	kern_return_t   kret = KERN_SUCCESS;
+--- a/iokit/Kernel/IOUserClient.cpp
++++ b/iokit/Kernel/IOUserClient.cpp
+@@ -33,6 +33,7 @@
+ #include <IOKit/IOUserClient.h>
+ #include <IOKit/IOService.h>
+ #include <IOKit/IORegistryEntry.h>
++#include "fuxi_regtrace_iokit.h"
+ #include <IOKit/IOCatalogue.h>
+ #include <IOKit/IOMemoryDescriptor.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+@@ -3650,6 +3651,7 @@
+ 	IOReturn            ret = kIOReturnSuccess;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	FRT_SCOPE(entry, property_name, "-", 0, 1);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3658,6 +3660,7 @@
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	FRT_PHASE(1);
+ 	if (!obj) {
+ 		return kIOReturnNoResources;
+ 	}
+@@ -3691,6 +3694,8 @@
+ 		ret = kIOReturnBadArgument;
+ 	}
+ 
++	FRT_SIZE(len);
++	FRT_PHASE(2);
+ 	if (bytes) {
+ 		if (*dataCnt < len) {
+ 			ret = kIOReturnIPCError;
+@@ -3718,6 +3723,7 @@
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	FRT_SCOPE(entry, property_name, "-", 0, 2);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3726,6 +3732,7 @@
+ #endif
+ 
+ 	obj = IOCopyPropertyCompatible(entry, property_name);
++	FRT_PHASE(1);
+ 	if (!obj) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -3738,6 +3745,8 @@
+ 
+ 	if (obj->serialize( s )) {
+ 		len = s->getLength();
++		FRT_SIZE(len);
++		FRT_PHASE(2);
+ 		*propertiesCnt = len;
+ 		err = copyoutkdata( s->text(), len, properties );
+ 	} else {
+@@ -3765,6 +3774,7 @@
+ 	OSObject *          obj;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	FRT_SCOPE(entry, property_name, plane, options, 4);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -3774,6 +3784,7 @@
+ 
+ 	obj = entry->copyProperty( property_name,
+ 	    IORegistryEntry::getPlane( plane ), options );
++	FRT_PHASE(1);
+ 	if (!obj) {
+ 		return kIOReturnNotFound;
+ 	}
+@@ -3786,6 +3797,8 @@
+ 
+ 	if (obj->serialize( s )) {
+ 		len = s->getLength();
++		FRT_SIZE(len);
++		FRT_PHASE(2);
+ 		*propertiesCnt = len;
+ 		err = copyoutkdata( s->text(), len, properties );
+ 	} else {
+@@ -3805,6 +3818,7 @@
+ 	io_buf_ptr_t *properties,
+ 	mach_msg_type_number_t *propertiesCnt )
+ {
++	FRT_SCOPE(OSDynamicCast(IORegistryEntry, registry_entry), "*", "-", 0, 8);
+ 	return kIOReturnUnsupported;
+ }
+ 
+@@ -3858,6 +3872,7 @@
+ 	void                 * editRef = NULL;
+ 
+ 	CHECK(IORegistryEntry, registry_entry, entry);
++	FRT_SCOPE(entry, "*", "-", 0, 16);
+ 
+ #if CONFIG_MACF
+ 	GetPropertiesEditorRef ref;
+@@ -3870,6 +3885,7 @@
+ 	}
+ #endif
+ 
++	FRT_PHASE(1);
+ 	s = OSSerialize::binaryWithCapacity(4096, editor, editRef);
+ 	if (!s) {
+ 		return kIOReturnNoMemory;
+@@ -3904,6 +3920,8 @@
+ 
+ 	if (kIOReturnSuccess == err) {
+ 		len = s->getLength();
++		FRT_SIZE(len);
++		FRT_PHASE(2);
+ 		if (buf && bufsize && len <= *bufsize) {
+ 			*bufsize = len;
+ 			*propertiesCnt = 0;
+@@ -3955,6 +3973,7 @@
+ 	const OSSymbol *    sym;
+ 
+ 	CHECK( IORegistryEntry, registry_entry, entry );
++	FRT_SCOPE(entry, property_name, plane, options, 32);
+ 
+ #if CONFIG_MACF
+ 	if (0 != mac_iokit_check_get_property(kauth_cred_get(), entry, property_name)) {
+@@ -4000,6 +4019,7 @@
+ 	}
+ 
+ 	sym->release();
++	FRT_PHASE(1);
+ 	if (!obj) {
+ 		return err;
+ 	}
+@@ -4012,6 +4032,8 @@
+ 
+ 	if (obj->serialize( s )) {
+ 		len = s->getLength();
++		FRT_SIZE(len);
++		FRT_PHASE(2);
+ 		if (buf && bufsize && len <= *bufsize) {
+ 			*bufsize = len;
+ 			*propertiesCnt = 0;
+--- a/osfmk/kern/Makefile
++++ b/osfmk/kern/Makefile
+@@ -115,8 +115,9 @@
+ XNU_ONLY_EXPORTS = \
+ 	arcade.h \
+ 	btlog.h \
+ 	cpu_quiesce.h \
++	fuxi_regtrace.h \
+ 	iotrace.h \
+ 	ipc_kobject.h \
+ 	lock_ptr.h \
+ 	perfmon.h \

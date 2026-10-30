@@ -57,7 +57,7 @@ pub struct ColorBlend {blend:u32,mask:u32,factors:[u32;6]}
 #[repr(C)]
 #[derive(Clone,Copy,Debug)]
 pub struct CompileOptions {format:u32,blend:u32,src_rgb:u32,dst_rgb:u32,rgb_op:u32,src_alpha:u32,dst_alpha:u32,alpha_op:u32,mask:u32,strip:u32,
- attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32,independent_blend:u32,color_count:u32,colors:[ColorOptions;7]}
+ attributes:[Attribute;8],strides:[u32;4],constant_count:[u32;2],constants:[[Constant;128];2],ordered_color_access:u32,independent_blend:u32,color_count:u32,colors:[ColorOptions;7],device_features:u32}
 impl CompileOptions {
  fn color(&self,i:usize)->ColorOptions {if i>0 {self.colors[i-1]} else {ColorOptions{format:self.format,blend:self.blend,src_rgb:self.src_rgb,dst_rgb:self.dst_rgb,rgb_op:self.rgb_op,src_alpha:self.src_alpha,dst_alpha:self.dst_alpha,alpha_op:self.alpha_op,mask:self.mask}}}
 }
@@ -82,6 +82,15 @@ impl Default for Push {fn default()->Self {Self{offset:0,size:0,stages:0,bytes:[
 #[repr(C)]
 #[derive(Default)]
 pub struct DrawOutput {descriptor_count:u32,push_count:u32,vertex_count:u32,indexed:u32,count:u32,first:u32,index_offset:u64,descriptors:[Descriptor;16],pushes:[Push;2],vertex_bindings:[u32;4],vertex_slots:[u32;4],vertex_offsets:[u64;4]}
+#[repr(C)]
+#[derive(Clone,Copy,Default)]
+pub struct DrawBufferRebase {active:u32,stage:u32,slot:u32,whole:u32,start:i64,size:u64,alignment:u64,max_range:u64}
+#[repr(C)]
+#[derive(Clone,Copy,Default)]
+pub struct DrawPushRebase {push:u32,offset:u32,kind:u32,source:u32}
+#[repr(C)]
+pub struct DrawRebase {enabled:u32,push_count:u32,buffers:[DrawBufferRebase;16],pushes:[DrawPushRebase;64]}
+impl Default for DrawRebase {fn default()->Self {Self{enabled:0,push_count:0,buffers:[DrawBufferRebase::default();16],pushes:[DrawPushRebase::default();64]}}}
 #[repr(C)]
 #[derive(Clone,Copy,Debug,Default)]
 pub struct Specialization {id:u32,offset:u32,size:u32}
@@ -495,7 +504,7 @@ unsafe fn name<'a>(p:*const c_char)->Result<&'a str,String> {
 }
 fn hash_options(hash:&mut Sha256,o:&CompileOptions)->Result<(),String> {
         for field in [o.format,o.blend,o.src_rgb,o.dst_rgb,o.rgb_op,o.src_alpha,o.dst_alpha,o.alpha_op,o.mask,o.strip,o.ordered_color_access] {hash.update(field.to_le_bytes());}
-        hash.update(o.independent_blend.to_le_bytes());hash.update(o.color_count.to_le_bytes());
+        hash.update(o.independent_blend.to_le_bytes());hash.update(o.device_features.to_le_bytes());hash.update(o.color_count.to_le_bytes());
         for c in o.colors {for field in [c.format,c.blend,c.src_rgb,c.dst_rgb,c.rgb_op,c.src_alpha,c.dst_alpha,c.alpha_op,c.mask]{hash.update(field.to_le_bytes());}}
         for attr in &o.attributes {for field in [attr.format,attr.offset,attr.buffer]{hash.update(field.to_le_bytes());}}
         for stride in o.strides {hash.update(stride.to_le_bytes());}
@@ -554,6 +563,16 @@ fn hash_product(p:&Product)->[u8;32] {
         let mut enabled=EnableSet::new();
         if options.independent_blend>1{return Err("independent blend enable".into());}
         if options.independent_blend==1{enabled.features.insert(VkFeature::IndependentBlend);}
+        // Must equal the VkDevice enables Backend made (CompileOptions::deviceFeatures). Bits: 1 f16, 2 storage16, 4 uniform16, 8 int16, 16 robustBufferAccess, 32 robustBufferAccess2, 64 robustImageAccess2.
+        if options.device_features>>7!=0 {return Err("unknown device feature bits".into());}
+        if options.device_features&1!=0 {enabled.features.insert(VkFeature::ShaderFloat16);}
+        if options.device_features&2!=0 {enabled.features.insert(VkFeature::StorageBuffer16BitAccess);}
+        if options.device_features&4!=0 {enabled.features.insert(VkFeature::UniformAndStorageBuffer16BitAccess);}
+        if options.device_features&8!=0 {enabled.features.insert(VkFeature::ShaderInt16);}
+        if options.device_features&16!=0 {enabled.features.insert(VkFeature::RobustBufferAccess);}
+        if options.device_features&32!=0 {enabled.features.insert(VkFeature::RobustBufferAccess2);}
+        if options.device_features&64!=0 {enabled.features.insert(VkFeature::RobustImageAccess2);}
+        if options.device_features&96!=0 {enabled.extensions.insert(VkExtension::ExtRobustness2);}
         if options.ordered_color_access!=0 {
             enabled.features.insert(VkFeature::RasterizationOrderColorAttachmentAccess);
             enabled.extensions.insert(VkExtension::ExtRasterizationOrderAttachmentAccess);
@@ -615,6 +634,16 @@ fn hash_product(p:&Product)->[u8;32] {
 mod tests {
     use super::*;
     use metal2vulkan::pipeline::SlotRef;
+    #[test]
+    fn shadow_windows_require_proven_readonly_descriptor_access() {
+        use metal2vulkan::pipeline::{BufferForm,BufferKind,DescriptorView,Window};
+        assert_eq!(std::mem::size_of::<ShadowWindow>(),24);
+        let form=BufferForm::Descriptor(DescriptorView::UniformWords);let bounded=Window::Bounded{start:-8,len:24};
+        let w=shadow_window(form,bounded,false,BufferKind::Buffer);assert_eq!((w.kind,w.start,w.size),(1,-8,24));
+        for w in [shadow_window(form,Window::Whole,false,BufferKind::Buffer),shadow_window(form,bounded,true,BufferKind::Buffer),
+                  shadow_window(BufferForm::Psb,bounded,false,BufferKind::Buffer),shadow_window(form,bounded,false,BufferKind::VisibleFunctionTable)] {assert_eq!(w.kind,0);}
+        unsafe {assert_eq!(fuxi_m2v_shadow_windows_v1(std::ptr::null_mut(),std::ptr::null_mut()),0);}
+    }
     #[test]
     fn bulk_module_scan_rejects_malformed_headers_and_instructions() {
         let valid=[0x07230203,0x00010500,0,2,0,0x00010000];scan_module(&valid).unwrap();
@@ -743,9 +772,10 @@ mod tests {
         assert_eq!(std::mem::size_of::<Descriptor>(),64);
         assert_eq!(std::mem::size_of::<BakedSampler>(),44);
         assert_eq!(std::mem::size_of::<DrawInput>(),1056);
+        assert_eq!(std::mem::size_of::<DrawBufferRebase>(),48);assert_eq!(std::mem::size_of::<DrawRebase>(),1800);
         assert_eq!(std::mem::size_of::<Translation>(),2488);
         assert_eq!(std::mem::size_of::<Constant>(),156);
-        assert_eq!(std::mem::size_of::<CompileOptions>(),40360);
+        assert_eq!(std::mem::size_of::<CompileOptions>(),40364);
         assert_eq!(std::mem::offset_of!(CompileOptions,constants),160);
         for (base,width) in [(3,4),(16,2),(29,4),(33,4),(37,2),(41,2),(45,1),(49,1),(53,1)] {
             for lane in 0..4 {assert_eq!(constant_payload_size(base+lane),width*(lane+1));}
@@ -864,6 +894,44 @@ fn reflect_textures(pipeline:&metal2vulkan::pipeline::RenderPipeline,state:&mut 
   }
  }
  u32::MAX
+}
+// Immutable shader access proof, independent of binding offsets and draw-plan caching.
+#[repr(C)] #[derive(Clone,Copy,Default)]
+pub struct ShadowWindow {kind:u32,reserved:u32,start:i64,size:u64}
+fn shadow_window(form:metal2vulkan::pipeline::BufferForm,window:metal2vulkan::pipeline::Window,writes:bool,kind:metal2vulkan::pipeline::BufferKind)->ShadowWindow {
+ use metal2vulkan::pipeline::{BufferForm,BufferKind,Window};
+ if matches!(kind,BufferKind::Buffer) && matches!(form,BufferForm::Descriptor(_)) && !writes {
+  if let Window::Bounded{start,len}=window{return ShadowWindow{kind:1,start,size:len,..Default::default()};}
+ }
+ ShadowWindow::default()
+}
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_shadow_windows_v1(product:*mut c_void,out:*mut ShadowWindow)->i32 {
+ use metal2vulkan::pipeline::SlotInterface;
+ if product.is_null() || out.is_null(){return 0;}
+ let p=&*(product as *const Product);let interface=&p.pipeline.interface;
+ if interface.needs_pointer_translation || interface.needs_handle_translation || interface.reaches_command_buffers{return 0;}
+ let windows=std::slice::from_raw_parts_mut(out,(SLOTS*2) as usize);
+ windows.fill(ShadowWindow{kind:2,..Default::default()});
+ for (slot,interface) in &p.pipeline.interface.slots {
+  if slot.class!=SlotClass::Buffer{continue;}
+  let stage=match slot.stage {Stage::Vertex=>0,Stage::Fragment=>1,_=>return 0};if slot.index>=SLOTS{return 0;}
+  let w=&mut windows[(stage*SLOTS+slot.index) as usize];*w=ShadowWindow::default();
+  if let SlotInterface::Buffer(b)=interface {
+   *w=shadow_window(b.form,b.window,b.access.write,b.kind);
+  }
+ }
+ // Pulled attributes synthesize Whole slots. Remove only slots proven to have no shader argument.
+ if p.options.attributes.iter().any(|a|a.format!=0 && a.buffer<SLOTS && windows[a.buffer as usize].kind==0) {
+  let mut descriptor=p.descriptor.clone();descriptor.vertex_descriptor=None;descriptor.fragment=None;
+  if let Ok(reflection)=descriptor.reflection(&Budget::standard()) {
+   for a in &p.options.attributes {
+    if a.format!=0 && a.buffer<SLOTS && windows[a.buffer as usize].kind==0 && !reflection.vertex_bindings().iter().any(|b|b.index()==a.buffer) {
+     windows[a.buffer as usize]=ShadowWindow{kind:2,..Default::default()};
+    }
+   }
+  }
+ }
+ 1
 }
 fn make_product(device:Device,descriptor:RenderPipelineDescriptor,options:&CompileOptions,mut state:BindState,variant:metal2vulkan::cache::VariantKey,initial:bool,request:Option<&[u8;32]>)->Result<Product,String> {
         let decoded=cached_render(&device,&descriptor,&variant,request)?;let pipeline=decoded.pipeline;
@@ -984,6 +1052,12 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
  Ok(())
 }
 #[no_mangle] pub unsafe extern "C" fn fuxi_m2v_draw(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,err:*mut c_char,cap:usize)->i32 {
+ draw_impl(product,input,out,std::ptr::null_mut(),err,cap)
+}
+#[no_mangle] pub unsafe extern "C" fn fuxi_m2v_draw_plan_v1(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,rebase:*mut DrawRebase,err:*mut c_char,cap:usize)->i32 {
+ if !rebase.is_null(){*rebase=DrawRebase::default();}draw_impl(product,input,out,rebase,err,cap)
+}
+unsafe fn draw_impl(product:*mut c_void,input:*const DrawInput,out:*mut DrawOutput,rebase:*mut DrawRebase,err:*mut c_char,cap:usize)->i32 {
  attempt(err,cap,|| {
   if product.is_null() || input.is_null() || out.is_null(){return Err("nil draw argument".into());}
   let p=&*(product as *const Product);let i=&*input;
@@ -1051,8 +1125,41 @@ fn check_plan(p:&metal2vulkan::bind::BindingPlan,expected:&metal2vulkan::cache::
   for (binding,offset) in c.buffer_offsets {let b=plan.vertex_buffers.iter().find(|b|b.binding==binding && !b.per_bind_stride).ok_or("vertex binding plan")?;
    let n=o.vertex_count as usize;o.vertex_bindings[n]=binding;o.vertex_slots[n]=b.buffer_index;o.vertex_offsets[n]=offset;o.vertex_count+=1;
   }
+  if !rebase.is_null(){*rebase=draw_rebase(p,&plan,&o).unwrap_or_default();}
   *out=o;Ok(1)
  }).unwrap_or(0)
+}
+
+// Export only metadata of the accepted public plan, never infer fields from push bytes.
+fn draw_rebase(p:&Product,plan:&metal2vulkan::bind::BindingPlan,o:&DrawOutput)->Option<DrawRebase> {
+ use metal2vulkan::{pipeline::{SlotInterface,BufferForm,Window,PushField},bind::FieldLocation};
+ let mut r=DrawRebase::default();let limits=p.device.profile().limits();
+ let stage=|s|match s {Stage::Vertex=>Some(0u32),Stage::Fragment=>Some(1u32),_=>None};
+ for (j,w) in plan.descriptors.iter().enumerate(){
+  if let WriteSource::Buffer{slot}|WriteSource::InlineBytes{slot}=&w.source {
+   let SlotInterface::Buffer(b)=p.pipeline.interface.slots.get(slot)? else {return None;};
+   if !matches!(b.form,BufferForm::Descriptor(_)) || b.access.write{return None;}
+   let (whole,start,size)=match b.window {Window::Whole=>(1,0,0),Window::Bounded{start,len}=>(0,start,len),_=>return None};
+   let (alignment,max_range)=match o.descriptors[j].ty {6=>(limits.min_uniform_buffer_offset_alignment,u64::from(limits.max_uniform_buffer_range)),7=>(limits.min_storage_buffer_offset_alignment,u64::from(limits.max_storage_buffer_range)),_=>return None};
+   r.buffers[j]=DrawBufferRebase{active:1,stage:stage(slot.stage)?,slot:slot.index,whole,start,size,alignment:alignment.max(16),max_range};
+  }
+ }
+ for f in &plan.push.fields {
+  let (kind,source)=match f.field {
+   PushField::SlotBindOffset(slot)=>{let n=stage(slot.stage)?;let j=r.buffers.iter().position(|b|b.active!=0 && b.stage==n && b.slot==slot.index)?;(1,j as u32)},
+   PushField::SlotGuestBase(slot)=>{if slot.class!=SlotClass::Buffer || slot.index>=SLOTS{return None;}(2,stage(slot.stage)?*SLOTS+slot.index)},
+   PushField::BaseVertexInstance=>(3,0),
+   PushField::ColorWriteRule(_)|PushField::StorageKeptChannels|PushField::BlendColor|PushField::HalfBlendColor|PushField::VertexBufferStride(_)|PushField::Specialized(_)|PushField::TextureLevels(_)|PushField::TextureHalfChannels(_)|PushField::TextureIntegerChannels(_)|PushField::InstanceCount(_)=>continue,
+   _=>return None,
+  };
+  let FieldLocation::PushWindow{offset}=f.location else {return None;};
+  let flags=if f.stage==Stage::Vertex{1}else{16};let width=if kind==1{4}else{8};
+  if f.size!=width{return None;}
+  let j=o.pushes[..o.push_count as usize].iter().position(|w|w.stages==flags && offset>=w.offset && offset-w.offset+width<=w.size)?;
+  if r.push_count as usize>=r.pushes.len(){return None;}
+  r.pushes[r.push_count as usize]=DrawPushRebase{push:j as u32,offset:offset-o.pushes[j].offset,kind,source};r.push_count+=1;
+ }
+ r.enabled=1;Some(r)
 }
 
 #[repr(C)]

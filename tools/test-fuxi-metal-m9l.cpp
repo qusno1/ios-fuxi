@@ -27,6 +27,21 @@ int main(int argc,char **argv){
   auto expected=[&](unsigned i){std::array<float,4> src=i%2?std::array<float,4>{.75f,.25f,.5f,.25f}:std::array<float,4>{.25f,.5f,.75f,.5f};
    if(i){auto alpha=src[3];for(unsigned c=0;c<3;++c)src[c]=src[c]*alpha+std::array<float,3>{.125f,.25f,.375f}[c]*(1-alpha);if(i%4==3)src[1]=.25f;}return src;};
   for(unsigned i=0;i<count;++i){assert(!targets[i]->isDefined(0) && targets[i]->isDefined(1));check(targets[i],1,expected(i));}
+  // Same-encoder MRT merging preserves every attachment's independent blend
+  // state and load/store actions, across 2/4/8 mixed-format mip targets.
+  auto mergePair=[&](fuxi::Operation first,fuxi::Pipeline *nextPipeline=nullptr){first.encoderID=77;auto second=first;if(nextPipeline)second.pipeline=nextPipeline;
+   for(unsigned i=0;i<count;++i){auto c=second.color(i);c.load=1;second.setColor(i,c);}
+   b.submit({first});b.submit({second});std::vector<std::vector<uint8_t>> reference;
+   for(auto *t:targets){pixels(t,1);auto n=t->levelWidth(1)*t->levelHeight(1)*fuxi::Backend::texelBytes(t->format);reference.emplace_back((uint8_t *)read->contents,(uint8_t *)read->contents+n);}
+   fuxi::FrameSample sample;{fuxi::FrameTraceScope scope(&sample);b.submit({first,second});}
+   bool merged=fuxi::systemTranslationPolicy().merge;assert(sample.passes==(merged?1u:2u) && sample.mergedDraws==unsigned(merged));
+   assert(sample.mergeSplits[size_t(fuxi::MergeSplit::fetch)]==0);
+   for(unsigned i=0;i<count;++i){pixels(targets[i],1);assert(!memcmp(read->contents,reference[i].data(),reference[i].size()));}
+  };
+  mergePair(draw);other=b.compilePipeline(lib,"mrt_vertex",lib,("mrt"+std::to_string(count)).c_str(),changed);mergePair(draw,other);b.destroy(other);
+  auto first=draw;first.encoderID=77;auto last=first;for(unsigned i=0;i<count;++i){auto c=last.color(i);c.load=1;c.store=i%2;last.setColor(i,c);}
+  fuxi::FrameSample discardSample;{fuxi::FrameTraceScope scope(&discardSample);b.submit({first,last});}assert(discardSample.passes==(fuxi::systemTranslationPolicy().merge?1u:2u));
+  for(unsigned i=0;i<count;++i)assert(targets[i]->isDefined(1)==bool(i%2));b.submit({draw});
   // Mixed Load/Clear/DontCare and Store/DontCare; a full-coverage draw makes
   // DontCare-load output defined, and a discarded level refuses readback.
   auto mixed=draw;for(unsigned i=0;i<count;++i){auto c=mixed.color(i);c.load=i%3;c.store=i%2;mixed.setColor(i,c);}
@@ -45,7 +60,7 @@ int main(int argc,char **argv){
    auto fetchOptions=options;fetchOptions.blend=0;for(auto &c:fetchOptions.colors)c.blend=0;
    auto *fetch=b.compilePipeline(lib,"mrt_vertex",lib,"fetch4",fetchOptions);assert(fetch->fetchMask==15);
    auto op=draw;op.pipeline=fetch;op.vertices=6;b.submit({op});
-   for(unsigned i=0;i<count;++i){std::array<float,4> value=i%2?std::array<float,4>{1.f,.4375f,.84375f,.5f}:std::array<float,4>{.40625f,.8125f,1.21875f,.875f};if(i==0)value[2]=1;if(i==3)value[1]=.25f;check(targets[i],1,value);}b.destroy(fetch);
+   for(unsigned i=0;i<count;++i){std::array<float,4> value=i%2?std::array<float,4>{1.f,.4375f,.84375f,.5f}:std::array<float,4>{.40625f,.8125f,1.21875f,.875f};if(i==0)value[2]=1;if(i==3)value[1]=.25f;check(targets[i],1,value);}mergePair(op);mergePair(op,pipeline);mergePair(draw,fetch);b.destroy(fetch);
   }
   for(auto *t:targets)b.destroy(t);b.destroy(pipeline);
  }
@@ -54,6 +69,8 @@ int main(int argc,char **argv){
  fuxi::CompileOptions sparse{};sparse.format=0;sparse.colorCount=8;sparse.colors[0].format=70;sparse.colors[6].format=115;sparse.attributes[0]={29,0,0};sparse.strides[0]=8;
  auto *sp=b.compilePipeline(lib,"mrt_vertex",lib,"sparse",sparse);auto *a=b.allocateTexture(70,5,8,8),*z=b.allocateTexture(115,5,8,8);
  fuxi::Operation op{};op.texture=a;op.colorCount=8;op.colorMask=130;op.colors[0].texture=a;op.colors[6].texture=z;op.pipeline=sp;op.buffers[0][0]={vertices,0,false};op.viewport={0,8,8,-8,0,1};op.scissor={{0,0},{8,8}};b.submit({op});check(a,0,{.75f,.25f,.5f,.25f});check(z,0,{.75f,.25f,.5f,.25f});
+ op.encoderID=78;auto next=op;for(unsigned i:{1u,7u}){auto c=next.color(i);c.load=1;next.setColor(i,c);}
+ fuxi::FrameSample sparseSample;{fuxi::FrameTraceScope scope(&sparseSample);b.submit({op,next});}assert(sparseSample.passes==(fuxi::systemTranslationPolicy().merge?1u:2u));check(a,0,{.75f,.25f,.5f,.25f});check(z,0,{.75f,.25f,.5f,.25f});
  b.destroy(a);b.destroy(z);b.destroy(sp);b.destroy(vertices);b.destroy(read);tr.close(lib);
  printf("M9l ordered_fetch=%u\n",unsigned(b.supportsOrderedColorAccess()));
  puts("PASS: M9l 2/4/8 MRT mixed formats/blend/masks, sparse slots 1+7, mip targets, independent actions, readbacks, alias/size bounds, rollback, cache identity/reuse, ordered four-input fetch when enabled");

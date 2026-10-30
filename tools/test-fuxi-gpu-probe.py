@@ -189,7 +189,7 @@ static void reset_model(void)
  memset(gpu_report, 0, sizeof(gpu_report)); memset(gpu_extra, 0, sizeof(gpu_extra));
  gpu_snapshot_valid = gpu_gmu_started = gpu_m2_attempted = gpu_s8_ok = 0;
  gpu_s9_attempted = gpu_s9_ok = gpu_s10_attempted = 0;
- g_gpu_selected = 0;
+ g_gpu_selected = 0; g_gpu_ddr_requested = 0;
  ticks = firmware_releases = mmio_writes = 0;
  cp_mode=0; blit_mode=0; abort_read=abort_write=0;
  ack_mode = corrupt_readback = tlb_busy = 0; firmware_success = 1;
@@ -328,7 +328,7 @@ static void panel_fixture(void)
 }
 
 /* Synthetic cmd-db BCM metadata, never captured board data. */
-static void bcm_fixture(void)
+static void bcm_fixture(uint32_t proportional_unit)
 {
  aux_fixture();
  static const char names[4][8]={"SH0","MC0","ACV","CN0"};
@@ -340,35 +340,66 @@ static void bcm_fixture(void)
   uint32_t address=0x50000+j*4;memcpy(p+16,&address,4);
   p[20]=j<3?8:0;p[22]=j*8;
   uint8_t *aux=gpu_cmddb+144+0x1100+j*8;
-  uint32_t unit=j<2?1000:0;memcpy(aux,&unit,4);
+  uint32_t unit=j<2?proportional_unit:0;memcpy(aux,&unit,4);
   aux[4]=j==0?16:j==1?4:0;aux[6]=j?1:0;
  }
 }
 static void test_clock_votes(void)
 {
- assert(g_gpu_select(0)==0 && g_gpu_select(6)==6 && !g_gpu_select(7));
- assert(!g_gpu_select(UINT64_MAX) && !g_gpu_select(0x100000001ULL));
- /* Actual cold-start messages, ACK path and final fixed vote for each level. */
- for(unsigned n=0;n<=6;n++) {
-  reset_model();bcm_fixture();g_gpu_selected=n;
+ assert(g_gpu_select(0)==0 && g_gpu_select(6)==6 && g_gpu_select(7)==7 && g_gpu_select(8)==8);
+ assert(!g_gpu_select(9) && !g_gpu_select(UINT64_MAX) && !g_gpu_select(0x100000001ULL));
+ const unsigned max_ddr[]={0,0,3,3,4,5,7,7,8};
+ const unsigned default_ddr[]={0,1,3,3,3,3,3,6,7};
+ const uint32_t kbps[]={0,2136718,3000000,6074218,6671875,8171875,10687500,12449218,14398437};
+ const uint64_t requests[]={0,1,2,3,4,5,6,7,8,9,UINT64_MAX,0x100000001ULL};
+ /* Actual cold-start PERF/BW messages, ACK and GX vote for every selection
+  * and override, with both non-saturating and saturating boot DB units. */
+ for(unsigned unit_case=0;unit_case<2;unit_case++)
+ for(unsigned n=0;n<=8;n++)
+ for(unsigned r=0;r<sizeof(requests)/sizeof(requests[0]);r++) {
+  uint64_t requested=requests[r];
+  unsigned clamped=n<2 || requested>8 ? 0 : requested>max_ddr[n] ? max_ddr[n] : requested;
+  unsigned dt=clamped?clamped:default_ddr[n];
+  assert(g_gpu_ddr_clamp(n,requested)==clamped);
+  reset_model();bcm_fixture(unit_case?1000:1000000);g_gpu_selected=n;g_gpu_ddr_requested=requested;
   assert(g_start() && gpu_s9_ok && firmware_releases==1);
+  uint32_t *perf=ptr(G_HFI_PA+4096);
+  const uint32_t freqs[]={0,220000,295000,348000,401000,475000,550000,615000,680000,719000};
+  const unsigned arcs[]={0,0x34,0x38,0x3c,0x40,0x50,0x80,0x90,0xc0,0xe0};
+  assert(perf[0]==0x103b04 && perf[1]==10 && perf[2]==3);
+  for(unsigned i=0;i<10;i++) {
+   unsigned secondary=i==0?0:i<=4?1:i<=6?2:3;
+   assert(perf[3+i*3]==(arcs[i]<<16|secondary<<8|i));
+   assert(perf[4+i*3]==0xffffffff && perf[5+i*3]==freqs[i]);
+  }
   uint32_t *wire=ptr(G_HFI_PA+4096+60*4);
-  assert(wire[1]==(n?3:1) && wire[2]==1 && wire[3]==3);
+  /* Golden packet layout, including all padding and legacy rows. Old levels
+   * with absent/zero DDR retain the exact original off/active packets. */
+  uint32_t expected[160]={0x20a003,n?3:1,1,3,1,n?5:7};
+  expected[6]=0x5000c;expected[12]=0x40000000;expected[18]=0x60000001;
+  for(unsigned j=0;j<3;j++) {
+   expected[24+j]=0x50000+j*4;
+   expected[32+j]=n && j==1?0:0x40000000;
+  }
   if(n) {
-   assert(wire[5]==5 && wire[32]==0x40000000 && !wire[33] && wire[34]==0x40000000);
-   /* unit=1000 and matching widths saturate both proportional votes. */
-   assert(wire[40]==0x6fffffff && wire[41]==0x2fffffff && wire[42]==0x60000000);
-   for(unsigned j=56;j<160;j++) assert(!wire[j]);
-  } else assert(wire[5]==7 && wire[32]==0x40000000 && wire[33]==0x40000000);
+   unsigned row2=n<2?6074:kbps[dt]/1000;
+   unsigned votes[]={unit_case?16383:2136,unit_case?16383:row2};
+   for(unsigned i=0;i<2;i++) {
+    expected[40+i*8]=0x60000000u|votes[i]<<14|votes[i];
+    expected[41+i*8]=0x20000000u|votes[i]<<14|votes[i];
+    expected[42+i*8]=0x60000000;
+   }
+  }
+  assert(!memcmp(wire,expected,sizeof(expected)));
   g_gx();assert(gpu_extra[0][60]==1);
   unsigned wr=*ptr(G_HFI_PA+68);
   uint32_t *vote=ptr(G_HFI_PA+4096+(wr-4)*4);
-  assert((vote[0]&255)==30 && vote[1]==1 && vote[2]==(n?n:1));
+  assert(vote[0]==0x50041e && vote[1]==1 && vote[2]==(n?n:1));
   assert(vote[3]==(n?(n==1?1:2):0));
  }
  /* Each malformed input refuses before CM3 release or a HFI doorbell. */
  for(unsigned bad=0;bad<12;bad++) {
-  reset_model();bcm_fixture();g_gpu_selected=2;
+  reset_model();bcm_fixture(1000);g_gpu_selected=2;
   uint8_t *p=gpu_cmddb+144+0x1000,*aux=gpu_cmddb+144+0x1100;
   switch(bad) {
    case 0:p[0]='X';break; // SH0 absent
@@ -388,14 +419,27 @@ static void test_clock_votes(void)
  }
  // Independent proportional arithmetic: known small non-saturating votes.
  struct g_bcm b[3]={{0x50000,1000000,16,0},{0x50004,1000000,4,1},{0x50008,0,0,1}};
- uint32_t out[160];assert(g_gpu_bw_packet(b,0x5000c,out));
+ uint32_t out[160];assert(g_gpu_bw_packet(b,0x5000c,14398437,out));
  assert(out[40]==(0x60000000u|(2136u<<14)|2136u));
  assert(out[41]==(0x20000000u|(2136u<<14)|2136u));
+ // Largest permitted DDR index: matching widths are below the cap at unit
+ // 1000000, and clamp safely for smaller units (no ACV performance bit).
+ assert(out[48]==(0x60000000u|(14398u<<14)|14398u));
+ assert(out[49]==(0x20000000u|(14398u<<14)|14398u) && out[50]==0x60000000);
+ for(unsigned unit=878810;unit<=878865;unit++) {
+  b[0].unit=b[1].unit=unit;
+  assert(g_gpu_bw_packet(b,0x5000c,14398437,out));
+  unsigned v=unit==878865?16382:16383;
+  assert(out[48]==(0x60000000u|v<<14|v) && out[49]==(0x20000000u|v<<14|v));
+ }
+ // Largest allowed aux widths and smallest unit cannot overflow arithmetic.
+ b[0].unit=b[1].unit=1;b[0].width=b[1].width=65535;
+ assert(g_gpu_bw_packet(b,0x5000c,14398437,out) && out[48]==0x6fffffff && out[49]==0x2fffffff);
  b[0].unit=UINT32_MAX;b[0].width=1;
- assert(g_gpu_bw_packet(b,0x5000c,out) && out[40]==0x60004001);
+ assert(g_gpu_bw_packet(b,0x5000c,14398437,out) && out[40]==0x60004001);
  b[0].vcd=b[1].vcd=b[2].vcd;
- assert(g_gpu_bw_packet(b,0x5000c,out) && out[5]==4 && !out[32] && !out[33]);
- puts("PASS: GPU levels 0..6, wide-input bounds, exact legacy/active HFI tables/votes, BCM VCD grouping/arithmetic and pre-release metadata refusal");
+ assert(g_gpu_bw_packet(b,0x5000c,14398437,out) && out[5]==4 && !out[32] && !out[33]);
+ puts("PASS: GPU levels 0..8, DDR indices 1..8/bus-max clamps, wide-input bounds, exact legacy/active HFI tables/votes, BCM VCD grouping/arithmetic and pre-release metadata refusal");
 }
 
 int main(int argc, char **argv)

@@ -45,7 +45,7 @@ int main(int argc,char **argv){
  // Invalid counts/levels/LOD fail before submission, without allocating or poisoning.
  auto charge=b.resourceBytes();reject([&]{b.allocateTexture(80,5,8,4,5);});reject([&]{b.allocateTexture(80,5,8,4,0);});assert(b.resourceBytes()==charge);
  auto bad=gen;bad.mipBase=4;bad.mipCount=2;reject([&]{b.submit({bad});});bad={};bad.texture=mips;bad.srcLevel=5;bad.dst=read;reject([&]{b.submit({bad});});
- reject([&]{b.allocateSampler(false,false,3);});reject([&]{b.allocateSampler(false,false,1,2,1);});
+ reject([&]{b.allocateSampler(false,false,3);});reject([&]{b.allocateSampler(false,false,1,2,1);});reject([&]{b.allocateSampler(false,false,1,0,1,nullptr,0,0);});reject([&]{b.allocateSampler(false,false,1,0,1,nullptr,0,17);});
  // Descriptor classes, including packed BGR10A2 and all existing small channels.
  for(uint32_t format:{80u,70u,115u,10u,30u,1u,94u}){auto *t=b.allocateTexture(format,format==1?1:21,8,4,4);for(unsigned l=0;l<4;++l){std::vector<uint8_t> bytes(t->levelWidth(l)*t->levelHeight(l)*b.texelBytes(format));for(size_t i=0;i<bytes.size();++i)bytes[i]=(uint8_t)(17*i+19*l);put(t,l,bytes);assert(get(t,l)==bytes);}b.destroy(t);}
  reject([&]{b.allocateTexture(81,1,8,4,4);});reject([&]{b.allocateTexture(1,4,8,4,4);});reject([&]{b.allocateTexture(80,2,8,4,4);});
@@ -67,6 +67,18 @@ int main(int argc,char **argv){
  // entries must differ between levels. Repeated draws reuse the correct view.
  auto *sam=b.allocateSampler(false,false);draw.samplers[0]=sam;draw.sampleBase[0]=3;draw.sampleCount[0]=1;draw.dstLevel=2;draw.viewport={0,2,4,-2,0,1};draw.scissor={{0,0},{4,2}};b.submit({draw});for(auto v:get(target,2))assert(abs(int(v)-144)<=1);
  auto frames=b.cachedFrames();b.submit({draw});assert(b.cachedFrames()==frames);
+ // Spotlight's exact attachment shape, through the real authored AIR bridge.
+ auto *blur=b.allocateTexture(80,5,704,96,10);auto *blurRead=b.allocate(704*96*4);
+ fuxi::Operation clearBlur{};clearBlur.texture=blur;clearBlur.clearOnly=true;for(auto &v:clearBlur.clear)v=0.25f;b.submit({clearBlur});
+ auto blurDraw=draw;blurDraw.texture=blurDraw.samples[0]=blur;blurDraw.sampleBase[0]=0;blurDraw.sampleCount[0]=10;blurDraw.dstLevel=1;blurDraw.areaWidth=352;blurDraw.areaHeight=48;blurDraw.viewport={0,48,352,-48,0,1};blurDraw.scissor={{0,0},{352,48}};
+ b.submit({blurDraw});assert(blur->isDefined(1) && !blur->isDefined(2));
+ fuxi::Operation blurGet{};blurGet.texture=blur;blurGet.srcLevel=1;blurGet.dst=blurRead;b.submit({blurGet});for(unsigned i=0;i<352*48*4;++i)assert(abs(int(((uint8_t *)blurRead->contents)[i])-64)<=1);
+ // Nonmip sampling reads absolute zero: writing that same level is refused.
+ auto feedback=blurDraw;feedback.dstLevel=0;reject([&]{b.submit({feedback});});
+ // View-relative zero in a level-one Metal view reads absolute one, writing zero.
+ feedback.sampleBase[0]=1;feedback.sampleCount[0]=1;b.submit({feedback});
+ b.destroy(blurRead);b.destroy(blur);
+ puts("PASS: real AIR bridge Spotlight 704x96 ten-mip level-1 pass, true feedback refusal and rebased upsample");
  // BGR10 render target packing and sampling use the translator's direct format.
  auto ten=options;ten.format=94;auto *p10=b.compilePipeline(lib,"fuxi_layer_vertex",lib,"fuxi_layer_fragment",ten);auto *target10=b.allocateTexture(94,5,4,2,1);auto d10=draw;d10.texture=target10;d10.pipeline=p10;d10.dstLevel=0;b.submit({d10});auto packed=get(target10,0);uint32_t value;memcpy(&value,packed.data(),4);assert(abs(int(value&1023)-578)<=3 && abs(int((value>>10)&1023)-578)<=3 && abs(int((value>>20)&1023)-578)<=3 && (value>>30)==2);
  // Sample the packed target through the real bridge, checking logical channels.

@@ -20,9 +20,9 @@ def main():
                         '-DFUXI_MTL_ICD="'+str(a.icd.resolve())+'"', '-I'+str(a.headers),
                         str(ROOT/'tools/fuxi-metal/FrameReuseTests.cpp'), '-ldl', '-pthread', '-o', str(binary)], check=True)
         for flag in ('', 'fuxigpupipelined=1', 'fuxigpupipelined=1 fuxigpupipelined=1',
-                     'fuxigpupipelined=invalid'):
+                     'fuxigpupipelined=invalid', 'fuxigpuframetrace=2'):
             p = subprocess.run([str(binary)], env=dict(os.environ, ASAN_OPTIONS='detect_leaks=0',
-                LP_NUM_THREADS='2', FUXI_MTL_TEST_BOOTARGS='fuxigpuframetrace=1 '+flag),
+                LP_NUM_THREADS='2', FUXI_MTL_TEST_BOOTARGS=flag if flag.startswith('fuxigpuframetrace=') else 'fuxigpuframetrace=1 '+flag),
                 capture_output=True, text=True, timeout=60)
             assert p.returncode == 0, p.stderr
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr, p.stderr

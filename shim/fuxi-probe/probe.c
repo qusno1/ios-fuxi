@@ -1175,10 +1175,11 @@ ud_setup(void)
         uint64_t off=(uint64_t)value | ((uint64_t)index<<16);
         const uint64_t size=1080ULL*2400*4;
         n=length > 512 ? 512 : length;
-        if (off>size || n>size-off || usb_rd(0xae05000,0x14)!=0xb8000000 ||
+        uint32_t base=usb_rd(0xae05000,0x14);
+        if (off>size || n>size-off || (base!=0xb8000000 && base!=0xb8a00000 && base!=0xb9400000) ||
             usb_rd(0xae05000,0x24)!=4320 || usb_rd(0xae05000,0x30)!=0x237ff)
             ok=false;
-        else memcpy(data,(const void *)(uintptr_t)(0xb8000000ULL+off),n);
+        else memcpy(data,(const void *)(uintptr_t)((uint64_t)base+off),n);
     } else if (type == 0xc0 && req == 0x4f) {
         /* Read-only display pipeline windows from live FDT: MDP top, CTL0,
          * INTF1 (+tear irq), DSC0 enc/ctl, PP0/PP1, DSI0 controller. MDSS top

@@ -357,7 +357,7 @@ def main():
                           if line.startswith(('static uint8_t wl_cdb8(', 'static uint32_t wl_cdb16(')))
     icc = driver.split('/* ---- milestone 6i:', 1)[1].split('/* ---- end milestone 6i ---- */', 1)[0]
     icc = '/* ---- milestone 6i:' + icc
-    runner = 'static void\nfw_run(' + driver.split('static void\nfw_run(', 1)[1].split('static void\nfw_thread(', 1)[0]
+    runner = 'static void wl17_clk_step(void) {} /* P17 SPMI sleep clock: kernel only */\nstatic void\nfw_run(' + driver.split('static void\nfw_run(', 1)[1].split('static void\nfw_thread(', 1)[0]
     source = PREAMBLE + transport + accessors + icc + runner + TESTS
     source = re.sub(r'__asm__ volatile\([^;]+;', '/* host barrier */;', source)
     with tempfile.TemporaryDirectory(prefix='fuxi-wlan-m6i-') as tmp:

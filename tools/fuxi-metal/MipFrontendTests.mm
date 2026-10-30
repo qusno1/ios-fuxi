@@ -1,4 +1,5 @@
 /* Native Mac ownership/descriptor/encoder tests; CPU model, GPU tested by M9k. */
+#define FUXI_MTL_HOST_TEST
 #define FUXI_MTL_FRONTEND_TEST
 #define FUXI_MTL_BACKEND_HEADER "TestBackend.hpp"
 #include "Frontend.mm"
@@ -44,6 +45,15 @@ int main(){@autoreleasepool {
  pass.colorAttachments[0].loadAction=MTLLoadActionClear;pass.colorAttachments[0].storeAction=MTLStoreActionStore;pass.colorAttachments[0].clearColor=MTLClearColorMake(1,0,0,1);
  c=(FuxiCommandBuffer *)[q commandBuffer];FuxiRender *r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:pass];assert(r && r->_state.dstLevel==2 && r->_state.areaWidth==3 && r->_state.areaHeight==1);[r endEncoding];[c commit];assert(!c.error);
  [t getBytes:output bytesPerRow:12 fromRegion:MTLRegionMake2D(0,0,3,1) mipmapLevel:2];for(unsigned x=0;x<3;++x){uint8_t red[]={0,0,255,255};assert(!memcmp(output+4*x,red,4));}
+ // The supplied Spotlight shape binds its full mip view before draw-time
+ // access analysis. Object identity alone must not fail this encoder.
+ auto blurDescriptor=[MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:704 height:96 mipmapped:YES];blurDescriptor.storageMode=MTLStorageModePrivate;blurDescriptor.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
+ FuxiTexture *blur=(FuxiTexture *)[device newTextureWithDescriptor:blurDescriptor];assert(blur.mipmapLevelCount==10);
+ FuxiPipeline *modelPipeline=[FuxiPipeline new];modelPipeline->_device=[device retain];modelPipeline->_pipeline=new fuxi::Pipeline{};
+ auto blurPass=ios16PassDefaults();blurPass.colorAttachments[0].texture=(id)blur;blurPass.colorAttachments[0].level=1;blurPass.colorAttachments[0].loadAction=MTLLoadActionClear;blurPass.colorAttachments[0].storeAction=MTLStoreActionStore;
+ c=(FuxiCommandBuffer *)[q commandBuffer];r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:blurPass];assert(r && r->_state.areaWidth==352 && r->_state.areaHeight==48);
+ [r setFragmentTexture:blur atIndex:0];assert(!c->_rejected);[r setRenderPipelineState:modelPipeline];[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];[r endEncoding];
+ assert(!c->_rejected && c->_ops.size()==1 && c->_ops[0].dstLevel==1 && c->_ops[0].samples[0]==blur->_texture && c->_ops[0].sampleBase[0]==0 && c->_ops[0].sampleCount[0]==10);[blur release];
  // Resource classes: public query values, private heap budgets, volatile/empty.
  for(MTLPixelFormat format:{MTLPixelFormatBGRA8Unorm,MTLPixelFormatRGBA8Unorm,MTLPixelFormatRGBA16Float,MTLPixelFormatR8Unorm,MTLPixelFormatRG8Unorm,MTLPixelFormatA8Unorm,MTLPixelFormatBGR10A2Unorm}){
   d.pixelFormat=format;d.usage=format==MTLPixelFormatA8Unorm?MTLTextureUsageShaderRead:MTLTextureUsageUnknown;d.storageMode=MTLStorageModePrivate;
@@ -67,10 +77,18 @@ int main(){@autoreleasepool {
  // and row stride while the entire surface allocation crosses HostImport.
  d.width=8;d.height=8;d.mipmapLevelCount=1;
  fuxi::Backend::modelHostImport=true;
+ d.usage=MTLTextureUsageShaderRead|MTLTextureUsageRenderTarget;
  IOSurfaceRef surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfaceBytesPerElement:@4,(id)kIOSurfacePixelFormat:@0x42475241});
  assert(surface && ![device newTextureWithDescriptor:d iosurface:surface plane:1]);
  FuxiTexture *st=(FuxiTexture *)[device newTextureWithDescriptor:d iosurface:surface plane:0];
- assert(st && fuxi::Backend::importOffset==0 && fuxi::Backend::importRow==IOSurfaceGetBytesPerRow(surface));[st release];CFRelease(surface);
+ assert(st && fuxi::Backend::importOffset==0 && fuxi::Backend::importRow==IOSurfaceGetBytesPerRow(surface));
+ FuxiTexture *surfaceAlias=(FuxiTexture *)[device newTextureWithDescriptor:d iosurface:surface plane:0];assert(surfaceAlias && surfaceAlias!=st);
+ auto surfacePass=ios16PassDefaults();surfacePass.colorAttachments[0].texture=(id)st;surfacePass.colorAttachments[0].loadAction=MTLLoadActionClear;surfacePass.colorAttachments[0].storeAction=MTLStoreActionStore;
+ c=(FuxiCommandBuffer *)[q commandBuffer];r=(FuxiRender *)[c renderCommandEncoderWithDescriptor:surfacePass];[r setRenderPipelineState:modelPipeline];[r setFragmentTexture:surfaceAlias atIndex:0];assert(!c->_rejected);
+ auto beforeSkip=fuxi::skippedSamplingDraws.load();[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+ assert(bool(c->_rejected)==!fuxi::systemTranslationPolicy().skipSampling);
+ if(fuxi::systemTranslationPolicy().skipSampling){assert(c->_ops.empty() && fuxi::skippedSamplingDraws==beforeSkip+1);[r endEncoding];assert(c->_ops.size()==1 && c->_ops[0].clearOnly);}
+ [surfaceAlias release];[st release];CFRelease(surface);
  surface=IOSurfaceCreate((CFDictionaryRef)@{(id)kIOSurfaceWidth:@8,(id)kIOSurfaceHeight:@8,(id)kIOSurfacePixelFormat:@0x42475241,(id)kIOSurfaceAllocSize:@16384,
   (id)kIOSurfacePlaneInfo:@[@{(id)kIOSurfacePlaneWidth:@8,(id)kIOSurfacePlaneHeight:@8,(id)kIOSurfacePlaneBytesPerElement:@4,
    (id)kIOSurfacePlaneBytesPerRow:@128,(id)kIOSurfacePlaneOffset:@4096,(id)kIOSurfacePlaneSize:@1024}]});
@@ -86,6 +104,6 @@ int main(){@autoreleasepool {
  assert(surface && IOSurfaceGetPlaneCount(surface)==2);d.pixelFormat=(MTLPixelFormat)542;
  assert(![device newTextureWithDescriptor:d iosurface:surface plane:0]);
  assert(![device newTextureWithDescriptor:d iosurface:surface plane:1]);CFRelease(surface);
- [buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
+ [modelPipeline release];[buffer release];[copy release];[nested release];[t release];assert(view.width==6);[view release];[q release];[device release];
  puts("PASS: native M9k descriptor/level transfers/views/blits/generation encoding/render attachment/private heap/purge/sampler/refusal controls");
 }}

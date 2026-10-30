@@ -24,6 +24,9 @@ GICD, GICD_SIZE = 0x17a00000, 0x10000
 GICR, GICR_SIZE = 0x17a60000, 0x100000
 FB, FB_SIZE = 0x9c000000, 0x1700000
 SWEET_ECID = 0x5357454554000001  # 'SWEET' + 1, synthetic
+# Synthetic, locally administered unicast MACs (02:...), not the phone's.
+SWEET_WIFI_MAC = bytes.fromhex('025357454501')
+SWEET_BT_MAC = bytes.fromhex('025357454502')
 FB_W, FB_H, FB_STRIDE = 1080, 2400, 1080 * 4
 # Internal UFS host (ufshc@1d84000 "ufs_mem"); QEMU virt has none
 UFS, UFS_SIZE = 0x01d84000, 0x3000
@@ -103,6 +106,14 @@ def build(seed=None, qemu=False, highmem=False):
         # of the A11 that the iPhone X userland expects.
         ('unique-chip-id', struct.pack('<Q', SWEET_ECID)),
         ('chip-id', u32(0x8015)),
+        # MobileGestalt's WifiAddressData/BluetoothAddressData (inputs of the
+        # pre-A12 UniqueDeviceID hash) read these 6-byte values first. Without
+        # them WifiAddressData falls back to waiting 5 s for an
+        # IONetworkController match on every uncached query, so code that asks
+        # for UniqueDeviceID per bundle (installd install identities during a
+        # LaunchServices reseed) stalls for minutes.
+        ('mac-address-wifi0', SWEET_WIFI_MAC),
+        ('mac-address-bluetooth0', SWEET_BT_MAC),
         # Security status as on a dev-fused, undemoted board (tuple 0,0,1,1):
         # MobileGestalt reads these from /chosen, and mobileactivationd's
         # DeviceType then takes its native "Hactivation" branch (state

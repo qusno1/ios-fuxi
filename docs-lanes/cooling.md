@@ -216,6 +216,135 @@ identityservicesd, locationd, CommCenter and iconservicesagent; the first
 three are already on demand after section 1, and iconservicesagent is kept
 for the home screen. No deeper CPU idle states exist in either project.
 
+## Thermal pressure to iOS
+
+Adapted from **HackiOS**, [oosexgang/hackios-xnu-userland](https://github.com/oosexgang/hackios-xnu-userland),
+commits `fcc3214` + `a79ff07`, `userland/src/thermald.c` and
+`com.redwood.thermald.plist`, **MIT**, copyright 2026 OOSEX GANG. The notice
+is retained in `tools/fuxi-thermald/LICENSE.HackiOS` and staged with the
+daemon. The governor pressure policy and root-cache integration are Fuxi
+adaptations. This update is scoped to the supplied diffs; no
+upstream code was executed or built and no newer revisions were fetched.
+
+**OBSERVED (source and host tests):** `fuxiperf=1 fuxitp=1` enables the
+read-only integer sysctl `kern.fuxipressure`. `fuxitp` accepts exactly `1`;
+missing/other values leave publication off. It requires the existing
+governor; it does not start a second MMIO reader or change frequency votes,
+sampling deadlines, thermal guards or duty limits. Reads return `ENOTSUP`
+when disabled (including failed governor initialization), `EBUSY` before
+the first sample, and a pressure value afterward. The existing serialized
+worker updates it after applying the thermal guard. A sysctl read only
+snapshots state under the governor lock.
+
+No iOS 16.x SDK `OSThermalNotification.h` was available on this Linux host.
+These are the **OSThermalPressureLevel wire values documented by the supplied
+HackiOS reference**, rather than the four-value `NSProcessInfoThermalState`
+enum. Their SDK declarations and consumer behavior remain unverified here:
+
+| Level | Value | Fuxi entry and recovery (CPU sensor temperatures) |
+| --- | --- | --- |
+| nominal | 0 | Valid quorum, thermal guard recovered, at/below resume (default 58 °C) after a pressure event |
+| moderate | 1 | Thermal guard blocked (including predictive/rise cuts), or at/above hot (default 62 °C); falls only when guard recovers and temperature is at/below resume |
+| heavy | 2 | At/above limit (default 68 °C), or lost sensor quorum; a valid sample at/below limit minus 4 °C permits recovery |
+| trapping | 3 | At/above 77 °C; valid temperature at/below 73 °C permits recovery |
+| sleeping | 4 | Reserved, never emitted: no thermal platform sleep policy is implemented |
+
+Higher levels take precedence and can be entered in one sample. Falling
+levels can skip directly to the current safe level. The guard already
+requires 500 ms of cool, slow-rising samples to recover. Lost quorum raises
+pressure to at least heavy and retains trapping if already reached; stale
+temperatures never relax it. Existing lowered hot/limit/resume boot args
+also lower the corresponding pressure thresholds. The 77 °C classifier
+adds no new frequency or hardware trip programming.
+
+`tools/fuxi-thermald/thermald.c` polls once per second, registers with
+`notify_register_check`, sets the level with `notify_set_state`, then posts
+`com.apple.system.thermalpressurelevel`. It publishes the initial valid
+level and subsequent changes only; a failed state update does not post,
+and a failed update/post retries next poll. Read errors retain the last
+published state; malformed sizes/levels are rejected. Early `EBUSY` waits
+for readiness. An absent/disabled service exits once, with no launchd
+respawn loop. `thermald show` (also `level`) prints the sysctl value/name
+without registering or publishing a notification.
+
+Build/sign on a Mac using the existing Xcode device-tool route:
+
+```sh
+bash tools/build-fuxi-thermald.sh
+# Also included in the tools target of tools/ci/build.sh.
+python3 tools/stage-fuxi-thermald.py MNT                     # inspect cache only
+python3 tools/stage-fuxi-thermald.py MNT --enable --binary tools/out/thermald
+python3 tools/stage-fuxi-thermald.py MNT --remove             # remove and restore
+```
+
+Staging is explicit opt-in. It validates the arm64 iOS 16 executable's
+Mach-O/signature command layout using the Metal staging helper (actual
+signature verification is performed by `codesign` during the Mac build),
+installs `/usr/local/bin/thermald`, its MIT notice and
+`/System/Library/LaunchDaemons/com.fuxi.thermald.plist`, and embeds that same
+job in `/System/Library/xpc/launchd.plist`. Cache owner/mode and unrelated
+jobs are preserved. Use a mounted writable root; this tool performs no
+mounting or device access. Reboot with `launchd_unsecure_cache=1` and
+`fuxiperf=1 fuxitp=1`. Pair staging with the boot arg: staging alone leaves
+the bridge daemon exiting without publication. `fuxitp=1` adds nine bytes
+including the separating space; keep the whole loader cmdline below
+608 bytes. No default image cmdlines are extended.
+
+**OBSERVED (available 16.7 root-cache snapshots):**
+`com.apple.thermalmonitord` is present and enabled, running
+`/usr/libexec/thermalmonitord`, with `KeepAlive={SuccessfulExit:false}`,
+a profile-change notify launch event and Mach services
+`com.apple.thermalmonitord.watchdog` and
+`com.apple.thermalMonitor.siriEnabledNote`. It is outside the on-demand
+keep list and is not explicitly disabled by our current job lists.
+On-demand stripping can still leave it Mach-activated. HackiOS's existing
+deny list also names thermalmonitord.
+
+**GUESS:** if Apple thermalmonitord runs, it could overwrite this shared
+notification state using missing iPhone sensors. No live competing writes
+were measured. To give this opt-in bridge one publisher, `--enable` uses
+`disable-launchd-jobs.py`'s shared `disable_jobs` helper to disable only
+matching thermalmonitord jobs if present. Their exact prior `Disabled`
+keys are saved under `_FuxiThermaldDisabled`; `--remove` restores them.
+Already-disabled jobs remain disabled, absent jobs require no change,
+and repeated staging preserves the original saved state. Other cooling
+on-demand edits are retained. Apply root changes before boot; changing the
+cache does not stop a process already running. Removing the boot arg alone
+does not undo the root-cache change; use `--remove` as well.
+
+**GUESS (device validation pending):** iOS consumers should react to the
+pressure notification, potentially lowering CA frame rate and application
+work while hot. This communicates thermal constraints; it makes no claim
+to improve frame rate. No phone, Mac cross-build, launchd execution, notify
+permissions, ProcessInfo transition or CA response was tested in this lane.
+On hardware, compare `thermald show` with governor temperatures/guard
+recovery, check initial/change-only daemon logs, verify the Apple job stays
+disabled, and observe app thermal state and frame pacing over heat/cool
+cycles. Do not force heat to reach trapping for validation.
+
+Host checks: `tools/test-fuxi-perf.py` compiles the actual worker, sysctl
+handler and policy with ASan/UBSan; `tools/test-fuxi-thermald.py` compiles
+the actual daemon against scripted sysctl/notify calls and tests staging
+on synthetic caches. `tools/sync-fuxi-perf.py --check` verifies patch 0097
+snapshots. Mac build/signing and hardware checks remain required.
+
+**OBSERVED (Linux verification):** all 47 existing test entrypoints that
+passed with default arguments before this change still pass, as does the
+new daemon/staging test. The Metal staging policy-only checks also pass.
+All 108 XNU patches apply in order to a fresh XNU source tree with locally
+available provider sources, and the final governor files match the canonical
+snapshots. Staging/removal on a copy of the available 530-job 16.7 cache
+restores its decoded contents exactly, using an authored Mach-O layout model
+(no executable/signing or device evidence).
+
+The supplied `hackios-kernel.diff` was reviewed and **not ported**: its
+1125×2048 ramfb mode addresses QEMU virt/bochs-VBE's height limit, while
+Fuxi uses its physical display and its own loader. The 7-Zip ≥23 guard is
+for HackiOS's `ios165/fetch.sh` APFS extraction path, which this project
+does not use. Neither change affects our thermal governor or iOS pressure
+publication. The userland diff's unrelated boot-store changes and thermal
+workload probe were also outside this port's scope.
+
 ## Left out
 
 - HackiOS's DENY list (jobs removed outright, not made on demand): on demand
@@ -311,3 +440,59 @@ Normal threads then run only on logical 2-6 (gold and prime). The A510s keep
 interrupts and bound threads. The mask must not set bits above 6 and must keep
 at least two of logical 2-6, otherwise it is ignored. GUESS: UI latency drops;
 heat and power impact are unmeasured.
+
+### Falling hold (2026-10-25)
+
+OBSERVED (first device run with `fuxitp=1`): thermald published 11 level changes
+in the first 90 s of boot, during the shader-compile burst at 50-64 C. Some
+were one log line apart: the rise latch toggled the level between nominal and
+moderate. Rises still publish at once. A fall now waits until the level has
+held for 10 s (`fp_pressure_hold`). GUESS: fewer notify wake-ups for iOS clients.
+
+## UniXNU SM8550 comparison (2026-10-27, offline)
+
+Read: UniXNU-sm8550-common (`dts/sm8550.dtsi`, `patches/xnu/*.patch`,
+`configs`), ArmCpu, UniXNU `docs/porting/{platform,power}.md` and UniXNU-sheng
+(`dts/sheng.dts`, `patches/xnu/zzye|zzyf`, `package/{CpuFreqProbe,GpuPowerProbe}.cpp`).
+All BSD-2-Clause-Patent; nothing copied here, differences only.
+
+**Core count.** Their tree boots all eight cores because their UEFI keeps no
+monitor on any of them. Ours runs 7: the missing one is **MPIDR 0x100 (cpu1,
+Cortex-A510)**, which hosts the loader's USB monitor (`tools/mkadt-fuxi.py`
+drops `cpus.children[1]`; `SWEET_SMP_MAX_CPUS 7`). **cpu7, the X3 prime core
+at MPIDR 0x700, does start**: J163 boot.log has `SWEET CPU: cpu=6 CPU_ON
+target=0x700 ... PSCI CPU_ON rc=0 ... mpidr=0x700 came alive; SGI1 OK`, and
+`FUXI PERF` reports prime at 1708 MHz under the load. The NOTES guess
+"cpu7 is never started (cpus=7 -> cpu0-6)" is wrong: logical 6 is cpu7. Getting the
+eighth core means retiring the USB monitor on cpu@100 first (GUESS: PSCI CPU_ON
+on a core the loader still runs would fail or collide), so it is not enabled;
+it is a loader change, not an ADT or PSCI one. Their PSCI path
+is identical to ours (SMC, CPU_ON by MPIDR, GICv3 redistributor stride 0x40000).
+
+**MPIDR to cpu number.** Their `start.s` patch widens the mask to
+`0xFFFF` because SM8550 numbers cores in Aff1; ours maps via the ADT `reg`
+(logical IDs in DT order, `SweetCPU`), which already works for 0x200..0x700.
+
+**Clusters.** Their ADT tags A510 as `E` and cpu3..cpu7 as `P`, builds with
+`__ARM_AMP__`, `MAX_CPU_CLUSTERS 2`, and runs the Edge scheduler with a patch
+that keeps UI buckets on P and lets idle P cores steal E work. We keep one
+homogeneous cluster (`cluster-type 0`) and the `fuxicores=0x7c` recommendation
+mask, which keeps normal threads off the A510s. Equivalent intent; theirs also
+lets the scheduler use E cores for background load and place by cluster
+load. Not ported: it changes scheduler topology on an XNU we cannot build or
+test offline, and we have no AMP perf controller either.
+
+**Frequency governors.** Theirs (CPU: per-CPU idle time every 16 ms, 1.25
+margin, 4-window step-down; touch holds P domains at top for 1 s; GPU frames
+keep CPUs at 60 % of top for 300 ms) has **no thermal guard** and reaches
+2.8/2.96 GHz. Ours (`fuxi-perf`) is event driven with the cool caps
+(gold 1.4, prime 1.36 GHz), duty budget and the 62/68 C cuts; nothing in theirs
+beats it for the stated goal, so the CPU policy is unchanged. The one idea kept
+is on the GPU side, see `gpu-clock.md` (idle governor).
+
+**Not comparable offline.** The SM8550 DTS in their repo carries CPU nodes, PSCI,
+GIC, UFS, GPU/GMU/SMMU only: no OPP tables, interconnect, thermal zones or
+reserved memory (those come from the pinned sm8550-mainline checkout, which is
+not in the mirror). GPU registers match what we already use (`3d00000`,
+`gmu 3d6a000`, `gpu_smmu 3da0000`, `adreno-43050a01`); the 220..680 MHz OPPs and
+bandwidth rows were already ported in `gpu-clock.h`.

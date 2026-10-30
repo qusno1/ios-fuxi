@@ -11,6 +11,7 @@ ROOT=Path(__file__).resolve().parents[1]
 PATCH=ROOT/'xnu/patches/0100-sweet-execswap-gpu-abi-trace.patch'
 CLIENT='iokit/Kernel/arm/FuxiAdrenoUserClient.cpp'
 HELPER='bsd/kern/sweet_execswap.h'
+INDEX='iokit/Kernel/arm/FuxiHandleIndex.h'
 
 def old_client():
     patch=(ROOT/'xnu/patches/0098-fuxi-native-adreno-abi.patch').read_text()
@@ -20,6 +21,7 @@ def old_client():
 def delta():
     result=''
     for target,old,new in [(HELPER,'',(ROOT/'xnu/fuxi-exec/sweet_execswap.h').read_text()),
+            (INDEX,'',(ROOT/'xnu/fuxi-adreno/FuxiHandleIndex.h').read_text()),
             (CLIENT,old_client(),(ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text())]:
         result+=''.join(difflib.unified_diff(old.splitlines(True),new.splitlines(True),fromfile='a/'+target,tofile='b/'+target))
     return result

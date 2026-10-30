@@ -581,6 +581,20 @@ def test_adt(tmp):
             raise AssertionError('missing D22AP tree accepted')
         except OSError:
             pass
+        # disp0 display options: absent by default, replaced (not duplicated) on rebuild.
+        plain = m.build(); before = adt.serialize(plain)
+        assert adt.serialize(m.set_display_options(plain)) == before
+        root = m.set_display_options(m.set_display_options(m.build(), 120000, False), 120800, True)
+        root, _ = adt.parse(adt.serialize(root))
+        disp0 = next(c for c in next(c for c in root.children if c.name == 'arm-io').children if c.name == 'disp0')
+        assert disp0.prop('fuxi,refresh-mhz') == struct.pack('<I', 120800) and disp0.prop('fuxi,swap-hist') == struct.pack('<I', 1)
+        assert [k for k, _, _ in disp0.props].count('fuxi,refresh-mhz') == 1 and disp0.prop('canvas-width') == struct.pack('<I', 1125)
+        for bad in (60000, 240001):
+            try:
+                m.set_display_options(m.build(), bad)
+                raise AssertionError('bad refresh accepted')
+            except ValueError:
+                pass
         mkadt.d22ap_product.__defaults__ = (str(Path(tmp) / 'absent.adt'),)
         try:
             m.add_product_children(m.build(), False, True, d22ap)
@@ -589,7 +603,7 @@ def test_adt(tmp):
             pass
     finally:
         mkadt.d22ap_product.__defaults__ = saved
-    print('PASS: mkadt-fuxi /product/haptics and /product/camera options (off by default)')
+    print('PASS: mkadt-fuxi /product/haptics, /product/camera and disp0 display options (off by default)')
 
 
 # ---- fuxi-sys-root.py -------------------------------------------------------------------

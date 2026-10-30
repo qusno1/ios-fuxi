@@ -10,6 +10,7 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 PATCH = ROOT / 'xnu/patches/0106-fuxi-unixnu.patch'
 FILES = {
+    'bsd/vfs/fuxi_unixnu_lookup.h': 'fuxi_unixnu_lookup.h',
     'bsd/dev/sweet_ufs.c': 'sweet_ufs.c',
     'bsd/dev/fuxi_unixnu_ufs.h': 'fuxi_unixnu_ufs.h',
     'bsd/dev/LICENSE.NativeUfs': 'LICENSE.NativeUfs',

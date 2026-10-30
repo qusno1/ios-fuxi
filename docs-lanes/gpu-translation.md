@@ -436,8 +436,9 @@ then publishes Completed and delivers handlers. `Backend::submit` holds its
 mutex through preparation, queue submission, fence completion and invalidation.
 A pipeline compilation or cache checkpoint can contend for that same mutex.
 
-The blocking/cost audit below refers to the implementation in this change;
-all paths are conditional unless described as every nonempty submit. Vulkan
+The blocking/cost audit below describes the synchronous/default path at its
+original audit snapshot; the later frame-overlap section covers the opt-in
+worker path. All paths are conditional unless described as every nonempty submit. Vulkan
 object creation and cache maintenance are synchronous CPU calls, not additional
 explicit GPU completion waits.
 
@@ -496,6 +497,11 @@ FUXI MTL: frame trace n=100 samples=100 wall=12.000/25.000/80.000 ms cpu_before_
   `lease_lock`: surface lease acquisition plus backend mutex acquisition over
   all operation segments. Surface unlock and post-fence retirement contribute
   to wall but are not included in this pair.
+  Split (p50/p90 ms, not yet observed on device): `lease_front` is the frontend
+  lease, `lease_back` the backend mutex/slot/admission part, `lease_excl_wait`
+  the user-level exclusion wait inside `lease_front`, `lease_lock_write` and
+  `lease_lock_read` the IOSurfaceLock time for written vs sampled-only surfaces,
+  and `lease_surfaces/frame` the surface counts by role.
 - `backend_submit`: after acquiring the backend mutex through return from
   `vkQueueSubmit`, including validation, flush, allocation, translation,
   recording and descriptor work. `gpu_wait`: time inside `vkWaitForFences`.
@@ -780,3 +786,563 @@ then off for latency. Include `relock_ms`, remaining Vulkan waits, integrity
 rejections, size traces and peak RSS. New translations still lower shaders and
 create Vulkan pipelines synchronously; this change does not make those stalls
 disappear.
+
+## Mip feedback passes (Spotlight blur)
+
+**OBSERVED (supplied device evidence):** two boots with the same scripted
+Spotlight gesture reached a BGRA8Unorm, 2D, 704×96 texture with ten mip levels,
+usage `0x5`. Color attachment zero wrote level 1 over 352×48, load 2/store 1;
+the fragment binding was the same texture with view base 0/count 10. The
+bind-time `sampling reject attachmentFeedback` immediately preceded the
+persisted backboardd runtime-failure/CPU-respawn gate. The supplied session
+measurements then showed roughly 20 fps and all five fast cores around 50%
+user time. This establishes the rejection and fallback sequence; the descriptor
+log alone does **not** establish the shader's LOD or sampler clamps.
+
+**Implemented:** feedback validation runs against the final translated runtime
+variant and draw bindings, after samplers and constants are available. The
+original host-owned `MipAccess.hpp` examines both stages' SPIR-V image accesses,
+matches descriptor set/binding to Metal texture/sampler slots, and conservatively
+unions possible mip levels. Nonmip samplers read view-relative level zero;
+mipmapped samplers bound implicit or unknown LODs with their min/max clamps.
+Plain explicit LODs can be narrowed from scalar constants, immutable uniform
+buffer/push bytes, constant-index access chains, scalar copies and simple vector
+component extraction. Linear/nearest filtering conservatively includes both
+neighboring integer levels. The original Metal view base is added exactly once.
+Reads of GPU-written uniform bytes are not inferred from stale host data.
+
+Unknown provenance, unsupported image operations (including fetches that bypass
+sampler clamps), arithmetic, dynamic indexing and unrecognized LOD expressions
+widen the range; they never infer `L-1` from the destination level or a blur
+function name. Any resulting range containing an attached mip is refused.
+Different images sharing memory/host ranges and equal IOSurface identities
+remain refused. The supported texture model has one slice; array/slice support
+is not added by this change. Multiple color attachments are checked individually.
+
+**Views and layouts:** retain the original Metal view's Vulkan base/count. For a
+view overlapping an attachment but with proven disjoint **accesses**, bind that
+view in `GENERAL`, and use `GENERAL` for the attachment inside the subpass too.
+This deliberately keeps the full view instead of rebasing an upsample view:
+explicit LODs, implicit derivatives, dimensions and level queries retain their
+existing meaning, including nonzero-base Metal views. There is no sampler bias
+or SPIR-V rewrite. Other views of that image are promoted to `GENERAL` when
+needed so their descriptor layouts agree. An already disjoint Metal view uses
+`SHADER_READ_ONLY_OPTIMAL` on its sampled levels and `GENERAL` on the attached
+level. Layout state and barriers are tracked separately for each mip, including
+source/destination transfers, mip generation and pre-submit rollback. Level-zero
+`layout` remains available to existing import/completion code. `GENERAL` is not
+permission for same-level feedback; the access proof is still required.
+
+**Opt-in gate policy:** `fuxigpuskip=1` omits an unsupported attachment-feedback
+shader draw, preserving its pass load/store actions and subsequent command work.
+It covers same-IOSurface refusals in the frontend and unproven/overlapping mip
+ranges or image aliases in the backend. It does not suppress resource, shader,
+Vulkan, device-loss or fence failures. Default behavior still fails through the
+existing gate. Duplicate, malformed and zero-valued keys disable skipping.
+Skips increment `skippedSamplingDraws` (also exported as
+`fuxi_metal_sampling_skipped_draws`); logs show the first eight and then powers of
+two. The periodic backboardd report includes `sampling_skipped`.
+
+**OBSERVED (host verification):** `test-fuxi-metal-mipfeedback.py` exercises the
+production backend with authored GLSL on software Vulkan under ASan/UBSan. The
+exact reported texture/pass shape reads level zero while writing level one;
+pixels, full-view upsampling, rebased views, same-level refusal, active gate
+survival with skipping, exact-token policy, mixed per-mip layouts/barrier order
+and recording-failure rollback are checked. `MipAccessTests.cpp` covers constant,
+uniform and push LODs, unknown/fetch refusal and range unions. The M9k suite also
+exercises the exact pass shape through the separately built AIR translator with
+this tree's authored AIR, including same-level refusal and rebased upsampling.
+The backend fill/copy and injected fence/device-loss/corruption controls, plus
+M9o authored line/shadow/trace regression controls, also passed. The skip test
+checks cumulative counts and the first-eight/powers-of-two log limit.
+Linux runs the frontend suite's portable policy/state controls; the native
+`MipFrontendTests.mm` additions (encoding the reported descriptor and same-
+IOSurface default/skip behavior) require Mac Foundation/Metal/IOSurface. The
+native frontend, defaults and Metal-SDK fixture suites require a Mac and their
+existing build outputs.
+
+**GUESS / unverified:** the private CA downsample reads `L-1`, and its upsample
+reads `L+1`. The shader/sampler data needed to prove those specific accesses was
+not supplied. These host controls establish supported access patterns, not that
+every private blur shader is recognized by the conservative interpreter. Device
+Turnip (`TU_DEBUG=sysmem,nocb`), actual Spotlight/Control Center/notification
+pixels, performance, compiler floating-point behavior and continued GPU rendering
+after blur remain unverified. Software Vulkan success is not an on-device result;
+Vulkan validation-layer coverage was unavailable in this host environment.
+
+## Frame overlap and submit cost
+
+### OBSERVED: supplied trace and code
+
+The supplied interaction excerpt after `e7d9133` has one trace row with
+`wall=19.055/27.153/32.887`, `cpu_before_commit=8.757/15.676`,
+`backend_submit=7.099/9.152`, `gpu_wait=11.335/17.216`,
+`gpu_exec=10.255/16.092`, and 140.57 draws/descriptor sets per surface command.
+Slash triples are p50/p90/max; pairs are p50/p90. Encode time is **outside**
+`wall`, and GPU timestamps overlap the fence wait. Percentiles of separate
+phases cannot be added to derive a total percentile. The reported session stays
+on the GPU and displays about 24–26 Hz; this is supplied device evidence, not a
+new device experiment.
+
+Previously `Frontend.mm` called `Backend::submit` on the committing thread.
+That method held the device mutex across `vkWaitForFences` (two-second timeout),
+invalidation and cleanup. Its single command pool, descriptor pool, fence and
+query pool could only be reset after that fence. The stack IOSurface lease,
+resource release and completion handlers also depended on synchronous return.
+Scheduled handlers were delivered after the wait. This explains the synchronous
+`gpu_wait`; `fuxigpupipelined` only reused alias-copy scratch.
+
+Per draw, submit validates bindings/bounds, calls the translator's draw planner,
+looks up or creates a runtime variant when requested, checks sampled access and
+attachment aliases, resolves render-pass/framebuffer/view caches, and records
+barriers, a render pass, pipeline/bindings and the draw. The old descriptor path
+allocated one set per draw and called `vkUpdateDescriptorSets` once **per
+binding**. Runtime variant lookup formatted every slot into an allocating
+`std::string`, then searched at most eight variants. The expensive mip
+interpreter **already skipped non-aliasing samples**; their whole-view definition
+checks remain. Image barriers and the per-operation memory barriers remain.
+
+### Opt-in settings and completion behavior
+
+| Boot argument | Behavior |
+| --- | --- |
+| `fuxigpuoverlap=1` | Serial submission worker, separate serial fence-retirement worker, two admitted commands per Metal queue and at most two Vulkan submissions per backend. |
+| `fuxigpusubmit=1` | Exact descriptor-set reuse within each submission, batched descriptor updates on misses, and fixed typed runtime-variant keys. |
+| `fuxigpuframetrace=1` | Existing trace; with overlap also reports `overlap_depth` and `completion_ms` p50/p90. |
+
+All are sampled once, absent/off by default, with no new environment fallback.
+Only one exact `=1` enables; zero, malformed values and duplicates disable.
+New names are 14 and 13 characters respectively. Existing admission, backend,
+feedback, cache and scratch policies remain independent. Rebuild FuxiMetal;
+this change requires no bridge, Mesa, metal2vulkan or NativeMetal modification.
+
+With overlap, commit snapshots no-copy shadow bytes and queues the command,
+then returns without waiting for its GPU fence. Explicit `enqueue` reserves
+queue order even when commits arrive in reverse order. Admission backpressure
+can block a third enqueue/commit until an earlier command retires. There is no
+unbounded internal work queue. An explicitly enqueued command must eventually
+be committed; reserving both slots without committing either prevents progress.
+Each backend lane owns its resettable pools, fence, timestamps and scratch.
+Queue submission/recording uses the device mutex; deferred fence waiting does
+not. A ticket pins buffers, textures, pipelines, samplers and transient Vulkan
+objects until retirement, independent of caller/cache references.
+
+`waitUntilScheduled` waits for successful submission or its error outcome.
+Scheduled handlers run before completed handlers. Per-queue retirement and
+handler delivery are serial, including when a caller sets a completion queue.
+`waitUntilCompleted` includes completion-handler delivery; calling it on the
+same command from its completed handler remains nonblocking. Handlers added
+while a fence is pending join its completion; late completed handlers run once
+on the delivery queue. Resources remain retained through GPU retirement.
+Presentation is delivered only after successful completion. IOSurface leases
+are released after the fence and invalidation; reuse of the same surface waits
+for its prior lease. Surface IDs are acquired in sorted order to avoid cycles.
+The original synchronous commit body remains the default path, with inline
+default handlers.
+
+Process-local event boundaries still use synchronous segments **on the
+submission worker** so signals follow preceding GPU writes. The final segment
+can retire asynchronously. Shared shadow refreshes and CPU index inspection
+drain previous flights. Noncoherent host allocations shared with an earlier
+flight drain before whole-allocation flush/invalidation can race that flight.
+Shadow refresh and recording are serialized together by the backend mutex;
+client bytes are snapshotted before commit returns. Mip proofs refuse to infer
+uniform LODs from host bytes while an earlier submission could have written them.
+These conservative cases can limit overlap.
+
+Fence timeout/device loss or an in-flight poison fails completion, releases
+admission slots, and quarantines GPU objects and producer leases. Device loss
+from another backend API also poisons pending submissions before cleanup.
+No uncertain DMA allocation is reset or destroyed, and failed overlap commands
+do not present. Quarantine intentionally persists until process/kernel teardown.
+
+Descriptor reuse is bounded to 256 exact entries per submission. Keys include
+set-layout identity, binding/type, buffer handle/offset/range and image
+view/sampler/layout; comparisons do not hash padding or omit dynamic ranges.
+Sets are immutable after creation and belong to their lane's pool until its
+fence. Push constants remain separate commands. Pools still size for the
+conservative per-draw maximum and reset only after retirement. The typed variant
+key preserves the old specialization facts, including exact float bits, without
+formatting strings. Extension discovery already uses
+`vkEnumerateDeviceExtensionProperties`; this implementation uses portable
+Vulkan descriptor sets and does not enable `VK_KHR_push_descriptor`. Actual
+Turnip extension availability was not queried on a device.
+
+With trace enabled, `overlap_depth` is admitted depth (including the command)
+at reservation; `completion_ms` is commit entry through fence retirement,
+invalidation, lease release and scheduled-handler delivery, before completed
+handlers. `wall` ends at fence retirement and lease release, so a slow scheduled
+handler can make completion latency larger than wall. Depth is not GPU utilization. `gpu_wait` now
+belongs to the retirement worker and overlaps CPU encoding/recording; it must
+not be added to CPU work to estimate throughput. Counts combine the creating
+thread's encode interval when known with the submission worker's own counters;
+GPU time comes from the command's own ticket, avoiding overlapping process-total
+attribution. Shadow snapshot allocation/copy is included in wall; `shadow_copy`
+measures the worker's refresh. Trace-off measurements are still needed.
+
+### OBSERVED: Linux verification and host measurements
+
+`test-fuxi-metal-overlap.py --glslang "$GLSLANG"` uses only local Vulkan headers,
+lavapipe, authored GLSL and the existing test adapter. It records 140 sampled
+draws per frame, alternates two texture bindings, warms three frames, then
+measures 40 frames (5,600 draws) in fresh-process A/B/B/A order. It checks final
+pixels; timing excludes fence waiting/JIT and is not a pass/fail threshold.
+Descriptor, object and recording subphases are measured by the existing backend
+counters. The fixture does not exercise runtime variant creation.
+
+Optimized C++ host run, timings in microseconds per draw (two runs per path):
+
+| Path | Submit CPU | Descriptor API/cache phase | Object API/cache phase | Remaining recording | Sets/frame |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Default | 14.154 / 17.795 | 5.292 / 6.555 | 5.142 / 6.301 | 2.976 / 3.819 | 140 / 140 |
+| `fuxigpusubmit=1` | 7.283 / 8.596 | 0.303 / 0.415 | 1.695 / 2.045 | 4.305 / 4.915 | 2 / 2 |
+
+Submit CPU for 140 draws was 1.982 / 2.491 ms versus 1.020 / 1.203 ms.
+There is substantial host scheduling variance; earlier runs also favored reuse,
+but these numbers establish neither a phone speedup nor a stable percentage.
+The descriptor phase includes the exact-cache search; binding normalization is
+in remaining recording. Validation, draw planning, barriers and driver submission
+remain costs. Different per-draw bindings may have much less reuse; the bounded
+linear search can itself become a cost.
+
+ASan/UBSan controls submit two real Vulkan commands before either ticket is
+retired, block a third submission until a lane retires, check GPU copy ordering
+and pixels, and verify no buffer destruction while pinned. Sampled controls
+drop caller texture/sampler/pipeline references and the object cache with both
+flights outstanding; all GPU allocations survive until the last retirement.
+Injected fence timeout, device loss and a device loss from another API fail both
+pending tickets without destroying their DMA objects. An ICD wrapper hides
+HOST_COHERENT to verify shared-range draining and flush/invalidate sequencing;
+this is a deterministic host control, not Turnip cache qualification. Portable
+surface tests block same-surface reuse and wake poisoned waiters without handoff.
+Trace tests cover overlap depth/latency fields and preserve default log fields.
+
+The existing frontend portable controls, software-Vulkan backend, frame-reuse,
+cache, translation, M6 sampled and M9g/M9h/M9i/M9k/M9l/M9m/M9n/M9o suites passed.
+M9g/H/I/K/L/O were also run with `fuxigpusubmit=1`; mip-feedback pixels/refusals
+passed with submit reuse and its feedback/skip combinations. The old M6 GLSL
+adapter needed its current identity/product-hash exports and MRT color-zero mask
+initialized; only that authored test adapter changed. The metal CI dry-run and
+Python syntax checks passed. Reproduction uses cached external inputs only:
+
+```sh
+python3 tools/test-fuxi-metal-overlap.py --glslang "$GLSLANG"
+python3 tools/test-fuxi-metal-mipfeedback.py --glslang "$GLSLANG"
+python3 tools/test-fuxi-metal-frontend.py
+python3 tools/test-fuxi-metal-backend.py --headers "$VULKAN_HEADERS"
+python3 tools/test-fuxi-metal-frametrace.py
+python3 tools/test-fuxi-metal-m6.py --headers "$VULKAN_HEADERS" --glslang "$GLSLANG"
+FUXI_MTL_TEST_BOOTARGS=fuxigpusubmit=1 \
+  python3 tools/test-fuxi-metal-m9k.py --translator "$HOST_TRANSLATOR"
+bash tools/ci/build.sh metal --dry-run
+```
+
+`OverlapFrontendTests.mm` is wired into the existing frontend runner and thus
+the metal build. It pauses retirement, checks commit return, explicit enqueue
+order under reversed commits, two-command backpressure, scheduled/completed
+handlers, pending/late handlers, self-wait, completion-queue routing, presentation,
+resource lifetime, no-copy snapshots and in-flight poison. **Native Objective-C
+execution, Foundation/Metal/IOSurface integration and the full Mac/iOS build
+require a Mac and were not run on Linux.** Defaults/SDK fixture suites likewise
+remain Mac-only. Host C++ tests do not establish native GCD/Objective-C behavior.
+
+### GUESS and risks requiring device acceptance
+
+Overlapping CA encoding/recording with GPU work should remove the old serial
+sum from steady-state throughput. It does not reduce the GPU's own roughly
+10 ms workload or guarantee 60 Hz. Same-surface reuse, shared shadows,
+noncoherent aliases, indexed CPU validation, event waits, translation and
+backend contention can still serialize work. Two lanes increase retained pools,
+scratch and in-flight resources; shadow snapshots also add host memory/copy
+cost. Scheduled handlers run on the submission worker and must return for that
+queue to progress. Completion handlers must not synchronously wait for later
+handlers on the same serial delivery queue.
+
+Actual Turnip behavior with `TU_DEBUG=sysmem,nocb`, driver CPU cost, private CA
+resource reuse, IOSurface/scanout timing, pixels under Spotlight/Control Center,
+thermal behavior, memory pressure, interaction Hz and the 60 Hz target are
+**unverified**. No device access, hosted runs, downloads or upstream source
+changes were used. Compare identical warm interactions with overlap and submit
+reuse individually, then together, preserving all other boot settings. Inspect
+depth/latency and failures with trace on, then repeat with trace off; a two-deep
+queue can improve throughput while increasing input-to-display latency.
+
+## GMEM trial (`fuxigpugmem=1`)
+
+OBSERVED (scripted gestures, `fuxigpuoverlap=1 fuxigpusubmit=1`): two frames
+stay in flight, and blur frames take 17/28/32 ms end to end (median/p90/max of
+~300-frame windows; gpu_exec ~10 ms median). CoreAnimation presents at ~26-30 Hz,
+which is about every other 60 Hz vsync. GUESS: per-frame latency, not
+throughput, keeps CA at half rate, and Turnip's sysmem rendering makes the
+bandwidth-heavy blur passes slow.
+
+`fuxigpugmem=1` sets the default `TU_DEBUG=nocb` (tiled GMEM rendering) instead of
+`sysmem,nocb`. An explicit TU_DEBUG environment value still wins. UniXNU saw
+GMEM hangs on A740, so this is a diagnostic opt-in only.
+
+## Render pass merging
+
+**OBSERVED (supplied device measurements):** CoreAnimation blur frames have
+about 115 draws, with `render_passes/frame == draws/frame`. Median `gpu_exec`
+is about 9.6 ms, or 83 microseconds per draw. The GMEM trial did not change
+that result. These are supplied measurements; no device was accessed here.
+The pre-merge backend recorded a separate `vkCmdBeginRenderPass`/`vkCmdEndRenderPass`
+and attachment/sample transitions plus a memory barrier for every draw.
+
+**OBSERVED (supplied follow-up, merge + overlap + submit + feedback):** about
+300 frames per window show 114–119 draws and 71–73 passes per frame, with
+`gpu_exec` median 8.6 ms versus the supplied unmerged 9.6 ms. Window split
+totals were `encoder:2176,fetch:4599,shadow:2194,non_draw:301`, all other
+reasons zero. Ordered framebuffer fetch was enabled through
+`VK_EXT_rasterization_order_attachment_access`. CA still presented around
+28 Hz; backboardd reported 1,757 late frames out of 5,435. These measurements
+precede the fetch/shadow extension below; they are not results of this change.
+Split reasons report the first blocker: removing fetch/shadow isolation may
+expose encoder or other boundaries. Subtracting those totals from passes is
+not a valid prediction of the new pass count.
+
+**GUESS:** repeated sysmem render-pass boundaries trigger Turnip CCU
+flush/invalidate/wait work and now dominate the GPU interval, contributing to
+CA's roughly 30 Hz presentation. Equal pass/draw counts and the unchanged GMEM
+result motivate this experiment; they do not measure CCU costs or establish
+that merging will reach 60 Hz. The follow-up identifies fetch and shadow
+refresh isolation as removable boundaries; legitimate encoder boundaries
+remain. Whether their removal improves CA latency or presentation is still
+a device experiment.
+
+Enable **`fuxigpumerge=1`**, independently of feedback, overlap, descriptor reuse
+and GMEM. Only one exact `=1` boot token enables it; absent, zero, malformed and
+duplicate tokens disable it. There is no environment fallback. Rebuild
+FuxiMetal; no translator or upstream driver changes are required. Default
+recording and the default frame-trace format retain their previous behavior.
+
+The frontend assigns a command-local identity when it creates each Metal
+render command encoder. Its existing first-load/later-load and final-store
+records remain authoritative; `endEncoding` still sets every final attachment's
+store action. Consecutive encoders always have different identities, including
+when they reuse identical attachments and start with Load. Identity zero means
+unknown and cannot merge. Command submissions and event segments are also
+boundaries; runs never cross them.
+
+The fetch extension retains the **existing** pipeline render-pass layout. On
+an ordered-capable device, every pipeline (ordinary, fetch, topology and runtime
+variant) already uses one subpass with all present colors also referenced as
+inputs, `VK_SUBPASS_DESCRIPTION_RASTERIZATION_ORDER_ATTACHMENT_COLOR_ACCESS_BIT_EXT`,
+and `GENERAL` layouts. Sparse slots retain `VK_ATTACHMENT_UNUSED` in both
+reference arrays; actual framebuffer views are compact. This common layout is
+essential: input attachment references participate in render-pass compatibility.
+Changing loads/stores does not change that compatibility. Input descriptors
+bind the current operation's target view at the fetched slot; merged runs require
+identical targets/levels, so those are the active merged framebuffer's views.
+The color-blend pipeline state also enables rasterization-order attachment access.
+
+No new pipeline mode or `fuxigpumerge2` is needed: pipeline creation remains
+unchanged with merge off/on. The device's enabled ordered-access value is already
+in `CompileOptions`, translator identities/product keys and device cache identity.
+Runtime variants belong to their original pipeline and inherit its options;
+topology variants use its render pass. The render-pass action cache is local to
+a pipeline with those fixed formats and ordered mode. There is no cache entry
+shared between incompatible merge/nonmerge layouts. Without ordered support,
+the old ordinary merge behavior and per-operation fetch fallback/refusal remain;
+this change does not admit unordered fetch.
+
+The opt-in planner runs after runtime variants, descriptor plans, sampling
+access proofs and skipped draws have been resolved. A run requires identical
+nonzero encoder identity, attachment mask/count, texture objects and mip
+levels, render-area fields, and compatible color formats. The admitted model
+already has one slice/depth plane and sample count one; nonzero slices and
+multisampling remain refused by the frontend. Every removed boundary must have
+Store on its left and Load on its right, for every present attachment.
+The Vulkan pass uses the first draw's loads/clear colors and the final draw's
+stores. Intermediate logical attachment definition checks and final
+`setDefined` updates retain their original semantics, including store DontCare.
+Viewport, scissor, pipeline, descriptors, push constants, vertex/index bindings
+and the draw command are still recorded individually.
+
+A texture shadow is a read-only optimal image used when a buffer-backed linear
+sampled texture cannot satisfy Vulkan's format/memory/layout requirements.
+`readShadow` records a backing-buffer-to-optimal-image refresh before use. This
+GPU transfer is separate from the frontend's CPU copy of no-copy buffer snapshots
+on the submission worker. CPU writes must precede commit; overlap's existing
+snapshot, shared-range drain, flush/invalidate and retirement rules still apply.
+
+All refresh transfers for a run now execute **once per distinct shadow before
+any sampling/attachment transitions**, then all image/mip transitions execute
+before begin. Read-layout transitions are deduplicated separately from refresh
+transfers; otherwise a repeated sample could copy in a shader-read layout.
+Deduplication ends with the run, so a later frame or run sees new backing bytes.
+A later shadow consumer splits if its backing buffer shares memory or host
+ranges with the unchanged attachments written by earlier draws in that run.
+A refresh needed only on the first draw can precede the run, even with such an
+alias. Shader storage writers and explicit transfers already form boundaries,
+so their dependent refreshes stay after the write. Ordinary read-only shadows
+no longer split.
+
+Ordered input reads can follow earlier color writes inside this one subpass;
+ordinary sampled attachment feedback still splits. The per-operation memory
+barrier remains at the end of the run. Singleton operations retain their old
+transitions and barriers. Texture layout/definition snapshots, including refreshed
+shadows, still roll back together on a pre-submit failure; deferred retirement
+keeps the existing lane ownership.
+
+Splits are deliberately conservative:
+
+- `encoder`: different or unknown encoder identity.
+- `attachments`, `area`: changed attachments, levels, formats or render area.
+- `actions`: an internal clear, DontCare load or discard store.
+- `attachment_sample`: any sampled attachment image or memory/host-range alias,
+  even proven-disjoint mips and GENERAL views. This isolates both producer and
+  consumer, including `fuxigpufeedback=1` draws, preserving inter-draw barriers.
+- `storage`: writable or unproven storage descriptors. Storage buffers can merge
+  only when the final SPIR-V explicitly decorates that variable NonWritable in
+  every referencing stage (including the translator's vertex-read buffers).
+  Member-only/unknown contracts stay isolated. An earlier shader's buffer write
+  cannot lose its barrier.
+- `buffer_alias`: an index buffer sharing attachment memory or host ranges.
+- `shadow`: a later refresh reads backing storage written by an earlier
+  attachment draw in the run (memory or host-range alias).
+- `fetch`: framebuffer fetch/input attachments without enabled ordered access;
+  the existing pipeline contract normally refuses these before recording.
+- `non_draw`: uploads, image/buffer copies, mip blits, fills and empty passes,
+  including render-area-limited `clearOnly` passes and skipped shader draws.
+
+Existing refusals, such as GPU copy destinations used as draw buffers in the
+same submission, remain refusals. This feature does not broaden resource or
+feedback admission. In particular, the feedback opt-in still cannot define
+same-draw same-texel feedback results; splitting only preserves ordering
+between draws.
+
+With `fuxigpuframetrace=1`, existing `draws/frame` and `render_passes/frame`
+count actual recorded draws and Vulkan begins. Merge mode appends
+`merged_draws/frame` (continuations, equivalently saved pass begins) and
+`merged_splits=encoder:N,attachments:N,...`. Split counts are window totals for
+adjacent operation boundaries involving a draw, classified by the first
+blocking reason; a hazard can count on both sides. They are neither counts of
+failed draws nor per-frame averages. The default trace has no appended fields.
+
+The `test-fuxi-metal-merge.py --glslang "$GLSLANG"` suite runs production Backend
+A/B pixel controls on local lavapipe with authored GLSL, ASan/UBSan and a Vulkan
+recording proxy. It compares every defined output byte with merging off/on
+for blending, first Clear/Load, discard followed by clear, partial render areas,
+encoder/action boundaries, uploads/copies/mip blits, empty partial passes,
+mip producer/consumer and GENERAL-view hazards. A storage-buffer read/write
+control requires two ordered single-fragment increments. Feedback and
+submit/overlap combinations run in fresh processes; true feedback compares
+only an untouched mip. Discard checks verify Vulkan storeOp and undefined
+bookkeeping, not unspecified discarded pixels. The proxy checks real
+pass/draw counts, actual load/store operations and the absence of barriers
+inside a pass. It also compares pipeline/pass attachment-reference compatibility,
+checks input descriptor views against the active framebuffer, and verifies that
+buffer-to-image copies use their most recently transitioned layouts outside passes.
+Recording rollback and two outstanding retirement tickets are also exercised.
+
+**OBSERVED (host correctness controls):** lavapipe exposes enabled ordered color
+access. Nineteen interleaved programmable-blend fetch/ordinary blend draws reduce
+from 19 passes to one with byte-identical output. A cleared first fetch checks
+an independently calculated color/alpha as well as A/B identity. Mip-target
+changes and two outstanding fetch flights check descriptor-view selection.
+The proxy forces production linear-shadow fallback by hiding linear sampling
+support: eleven draws alternating two shadows reduce from 11 passes / 11 copies
+to one pass / two copies. Three frames change CPU backing bytes and require new
+output each frame. Backing-buffer fills and attachment-memory aliases prove
+refreshes stay after producers; a first-draw-only alias refresh still merges.
+Shadow rollback and two outstanding shadow flights pass; the latter changes
+CPU bytes between submissions using independent per-frame backing allocations,
+so it exercises overlap without racing bytes still read by the earlier flight.
+All controls run with feedback off/on and with overlap/submit reuse combined. Hiding the ordered
+extension tests the fallback separately. When ordered color access is absent,
+fetch pixel controls print an explicit SKIP; ordinary/shadow controls still run.
+
+M9l adds byte-identical mixed-format 2/4/8 MRT runs, sparse slots, and ordered
+four-input fetch merges across fetch/ordinary pipeline changes in both directions.
+The portable `OperationAPITests` compiles the Mac model's `TestBackend.hpp` and
+checks encoder identity plus sparse attachment helpers/copies; no Operation/API
+fields changed in this extension. Native frontend assertions across `endEncoding`
+and full Objective-C compilation still require a Mac.
+
+**OBSERVED (host benchmark):** optimized C++, local lavapipe, 140 sampled draws
+in one encoder identity, two alternating bindings, three warm-up frames and 40
+measured frames per fresh process. Each setting runs A/B/B/A; times are means
+per frame within each run, in milliseconds. Submit CPU excludes fence waiting;
+GPU timestamps cover the software Vulkan execution interval. Descriptor reuse
+is held constant within each comparison. Pixel and pass-count assertions run
+in every benchmark; timings have no pass/fail threshold.
+
+| Descriptor reuse | Merge | Passes/frame | Submit CPU ms/frame, runs 1 / 2 | GPU timestamp ms/frame, runs 1 / 2 |
+| --- | --- | ---: | ---: | ---: |
+| Off | Off | 140 | 1.941 / 3.236 | 4.061 / 6.871 |
+| Off | On | 1 | 2.359 / 1.751 | 5.057 / 4.540 |
+| On | Off | 140 | 0.931 / 1.016 | 5.512 / 4.939 |
+| On | On | 1 | 0.391 / 0.558 | 3.375 / 5.036 |
+
+Each merged frame reports 139 merged continuations and still executes all 140
+draws. Sets/frame remain 140 with descriptor reuse off and two with it on.
+Scheduling variance is substantial, especially in the reference GPU interval;
+these results establish host pass reduction and correctness, not a stable
+speedup percentage or an Adreno latency prediction.
+
+**OBSERVED (encoder boundary cost control):** the same runner also holds merge
+and descriptor reuse **on**, varying only one encoder versus 140 encoder IDs.
+It requires all 139 encoder split reasons and all 140 draws on the split path.
+Fresh-process A/B/B/A, three warm-up / 40 measured frames, same local lavapipe:
+
+| Encoders/frame | Passes/frame | Submit CPU ms/frame, runs 1 / 2 | GPU timestamp ms/frame, runs 1 / 2 |
+| ---: | ---: | ---: | ---: |
+| 140 | 140 | 0.818 / 1.356 | 3.257 / 9.497 |
+| 1 | 1 | 0.373 / 0.437 | 3.381 / 3.659 |
+
+The merged draw's amortized submit CPU cost is **2.663 / 3.121 microseconds**;
+the split draw costs **5.839 / 9.687 microseconds**. The paired difference
+divided by 139 extra boundaries is **3.201 / 6.612 microseconds CPU** and
+**−0.892 / 42.000 microseconds GPU** per boundary. This measures the backend's
+boundary plus transitions/barrier path, not an isolated Vulkan begin/end call.
+The negative first GPU difference and large second outlier show that this host
+run cannot establish a stable marginal GPU boundary cost. No timing threshold
+is asserted, and none of these numbers estimates Turnip CCU cost.
+
+Linux verification passed: the new merge suite; frontend portable controls
+(including exact-token policy, storage declaration proofs and trace/reset
+fields); backend fill/copy plus timeout/loss/corruption controls; frame trace;
+M6 with authored GLSL; mipfeedback; overlap; cache, cache-hits and translation;
+M9a through M9b (offline Rust bridge tests and production cache controls);
+M9g/H/I/K/L/M/N/O; staging's policy/storage controls; and the metal build
+dry-run. M9g/H/I/K/L/O also passed with merge, overlap and descriptor reuse enabled.
+M9g/I/L/O additionally ran with feedback enabled. H/K contain strict feedback/
+undefined-read refusal assertions: enabling feedback intentionally defeats those
+assertions, so their supported combined run keeps feedback off; feedback-on
+pixels and overlap are covered by the merge/mipfeedback suites. Portable checks
+also include the Mac model Operation API guard. The older metal/metal2/metal2g/
+metal2h kernel/ABI suites passed as well.
+M9l compares byte-identical MRT output across pipeline changes and checks mixed
+final attachment discard actions as well as sparse attachments and fetch merges.
+All external inputs were already cached; no downloads or upstream source edits
+were used. Reproduction of the new controls and MRT comparison:
+
+```sh
+python3 tools/test-fuxi-metal-merge.py --glslang "$GLSLANG"
+FUXI_MTL_TEST_BOOTARGS='fuxigpumerge=1 fuxigpuoverlap=1 fuxigpusubmit=1' \
+  python3 tools/test-fuxi-metal-m9l.py --translator "$HOST_TRANSLATOR"
+python3 tools/test-fuxi-metal-frontend.py
+bash tools/ci/build.sh metal --dry-run
+```
+
+**Unverified / risks:** native Objective-C encoder identity tests, GCD/IOSurface
+integration and the full Mac/iOS build require a Mac. Defaults/pipeline/M6b/M7
+wrappers require native SDK-built fixture inputs; artifact qualification and
+CA offline replay require external build or proprietary inputs and were not
+run here. The authored AIR paths were covered by the listed Linux suites.
+No firmware or Apple binaries were used. The recording proxy is not full
+Vulkan validation-layer qualification.
+
+CA grouping, pass counts and timing for the original merge opt-in are supplied
+above. The fetch/shadow extension's device merge rate, Turnip CCU behavior under
+`TU_DEBUG=sysmem,nocb`, pixels, memory pressure, latency and presentation Hz
+remain unverified. Attachment-sampling, storage and dependent shadow refresh splits
+can leave passes intact, especially in mip chains. Actual encoder boundaries
+remain regardless of the cost measured on a host. Hoisting adds
+submission-owned planning/transition state; it does not add Vulkan in-flight
+lanes or extend work across encoder/submission boundaries. Feedback's existing
+same-draw undefined texels remain undefined. Compare identical warm device
+interactions with only merge toggled, inspect pass/draw counts and split
+reasons with trace on, then repeat with trace off. A host pass reduction does
+not establish the guessed device bottleneck or a 60 Hz result.

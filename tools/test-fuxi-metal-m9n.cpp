@@ -49,10 +49,10 @@ int main(){
  assert(t->isDefined(1));read.srcLevel=1;read.width=4;read.height=3;read.rowBytes=24;read.to=4;b.submit({read});
  for(unsigned y=0;y<3;++y)assert(!memcmp(result+4+y*24,bytes+16+(y+1)*40+8,16));
  // Invalid requests and pre-submit failures leave data/layout/budget reusable.
- auto charged=b.resourceBytes();auto bad=copy(t,t,7,0,0,0,2,1);refuses([&]{b.submit({bad});});
+ b.trimMemory();auto charged=b.resourceBytes();auto bad=copy(t,t,7,0,0,0,2,1);refuses([&]{b.submit({bad});});
  bad=copy(t,t,0,0,0,0,1,1,3,0);refuses([&]{b.submit({bad});});
  auto *different=b.allocateTexture(70,5,8,6);refuses([&]{b.submit({copy(t,different,0,0,0,0,8,6)});});b.destroy(different);
- auto *undefined=b.allocateTexture(80,5,8,6);refuses([&]{b.submit({copy(undefined,t,0,0,0,0,8,6)});});b.destroy(undefined);
+ auto *undefined=b.allocateTexture(80,5,8,6);refuses([&]{b.submit({copy(undefined,t,0,0,0,0,8,6)});});b.destroy(undefined);b.trimMemory();
  b.failBeforeQueue=true;refuses([&]{b.submit({copy(t,t,0,0,1,1,4,3)});});assert(!b.poisoned && b.resourceBytes()==charged);
  // Mip generation, fill and the existing transfer commands compose in order.
  fuxi::Operation fill{};fill.dst=up;fill.to=16;fill.size=256;fill.value=0x5c;
@@ -73,6 +73,6 @@ int main(){
   for(unsigned y=0;y<6;++y)assert(!memcmp((uint8_t *)host+(y+1)*64+4,saved.data()+y*64,56));
   b.destroy(a);b.destroy(alias);free(host);
  }
- b.destroy(t);b.destroy(other);b.destroy(up);b.destroy(out);assert(b.resourceBytes()==baseline);
+ b.destroy(t);b.destroy(other);b.destroy(up);b.destroy(out);b.trimMemory();assert(b.resourceBytes()==baseline);
  puts("PASS: M9n formats/packed channels, native 1D/mips, overlapping/disjoint/self/import aliases, padded buffer transfers, fill/generation, bounds/format/undefined refusal, rollback/budget, tight linear image size");
 }

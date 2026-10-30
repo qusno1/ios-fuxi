@@ -8,6 +8,12 @@ import subprocess
 import tempfile
 ROOT=Path(__file__).resolve().parents[1]
 TEST=r'''
+#include <atomic>
+#include <cstdint>
+#include <ctime>
+static std::atomic<unsigned> cpuReads{0};
+static uint64_t countedCPU(){++cpuReads;timespec t{};if(clock_gettime(CLOCK_THREAD_CPUTIME_ID,&t))return UINT64_MAX;return uint64_t(t.tv_sec)*1000000000ULL+t.tv_nsec;}
+#define FUXI_MTL_THREAD_CPU_NS countedCPU
 #include "fuxi-metal/Backend.hpp"
 #include <cassert>
 #include <cstdio>
@@ -23,10 +29,30 @@ int main() {
    auto *src=backend.allocate(65536),*dst=backend.allocate(65536);
    for(unsigned i=0;i<16;i++) {
     uint8_t value=uint8_t(0xa0+i);memset(src->contents,0x39,src->length);memset(dst->contents,0x52,dst->length);
-    backend.submit({{nullptr,src,0,4,65528,value},{src,dst,4,8,65520,0}});
+    auto readsBefore=cpuReads.load();fuxi::FrameSample timing;
+    {fuxi::FrameTraceScope scope(&timing);backend.submit({{nullptr,src,0,4,65528,value},{src,dst,4,8,65520,0}});}
+    if(fuxi::systemTranslationPolicy().frameCPU)assert(timing.backendCPU && cpuReads==readsBefore+2);
+    else assert(cpuReads==0 && !timing.backendCPU);
+    assert(!timing.recordCPU && !timing.queueSubmitCPU && !timing.kernelIOCPU);
     verify(src,0,4,0x39);verify(src,4,65528,value);verify(src,65532,4,0x39);
     verify(dst,0,8,0x52);verify(dst,8,65520,value);verify(dst,65528,8,0x52);
    }
+   // A lock holder sleeps on another thread: wall time must show that wait,
+   // while CPU clocks on the submitting thread must not charge its sleep.
+   std::atomic<bool> locked{false};
+   std::thread holder([&]{std::lock_guard<std::mutex> guard(backend.mutex);locked=true;std::this_thread::sleep_for(std::chrono::milliseconds(40));});
+   while(!locked.load())std::this_thread::yield();
+   fuxi::FrameSample blocked;
+   {fuxi::FrameTraceScope scope(&blocked);backend.submit({{nullptr,src,0,0,64,1}});}
+   holder.join();
+   if(fuxi::systemTranslationPolicy().frameTrace)assert(blocked.backendLock>20000000);
+   if(fuxi::systemTranslationPolicy().frameCPU)assert(blocked.backendCPU && blocked.backendCPU<blocked.backendLock/2);
+   if(!fuxi::systemTranslationPolicy().frameCPU)assert(cpuReads==0);
+   // Event-segmented frames retain a fixed two-read backend CPU budget.
+   fuxi::FrameSample segmented;auto before=cpuReads.load();
+   {fuxi::FrameTraceScope scope(&segmented);for(unsigned i=0;i<120;++i)backend.submit({{nullptr,src,0,0,64,1}});}
+   if(fuxi::systemTranslationPolicy().frameCPU)assert(cpuReads==before+2 && segmented.cpuSampledSubmits==1 && segmented.cpuOmittedSubmits==119);
+   else assert(cpuReads==before);
    backend.destroy(src);backend.destroy(dst);
   }
   puts("PASS: actual backend 32 GPU fill/copy submissions, CPU cache transitions, sentinel edges, reuse, reopen");
@@ -48,12 +74,12 @@ def main():
         subprocess.run(flags+['-shared','-fPIC',str(d/'proxy.cpp'),'-ldl','-o',str(d/'proxy.so')],check=True)
         subprocess.run(flags+['-fsanitize=address,undefined','-DFUXI_MTL_HOST_TEST','-DFUXI_MTL_ICD="'+str(d/'proxy.so')+'"',
             '-I'+str(ROOT/'tools'),str(d/'test.cpp'),'-ldl','-pthread','-o',str(d/'test')],check=True)
-        env=dict(os.environ,SOFTWARE_ICD=str(a.icd),ASAN_OPTIONS='detect_leaks=0')
-        for extra,expected in (({},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
+        env=dict(os.environ,SOFTWARE_ICD=str(a.icd),ASAN_OPTIONS='detect_leaks=0',FUXI_MTL_TEST_BOOTARGS='')
+        for extra,expected in (({},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=1'},0),({'FUXI_MTL_TEST_BOOTARGS':'fuxigpuframetrace=2'},0),({'TIMEOUT':'1'},1),({'LOST':'1'},1),({'BAD_FILL':'1'},1)):
             p=subprocess.run([str(d/'test')],env=dict(env,**extra),text=True,capture_output=True,timeout=30)
             assert p.returncode==expected,(extra,p.stdout,p.stderr)
             assert 'AddressSanitizer' not in p.stderr and 'runtime error:' not in p.stderr,p.stderr
-            if not extra:print(p.stdout,end='')
+            if expected==0:print(p.stdout,end='')
             else:assert 'FAIL' in p.stderr,p.stderr
         print('PASS: injected fence timeout, device loss, last-byte corruption stop execution')
 if __name__=='__main__':main()

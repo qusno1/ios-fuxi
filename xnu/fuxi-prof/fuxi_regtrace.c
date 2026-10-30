@@ -1,0 +1,95 @@
+/* Completion windows; fixed storage, no registry objects retained. */
+#include <pexpert/arm64/board_config.h>
+#if defined(FUXI)
+#include <sys/param.h>
+#include <sys/proc.h>
+#include <sys/systm.h>
+#include <kern/clock.h>
+#include <kern/locks.h>
+#include <kern/thread.h>
+#include <pexpert/pexpert.h>
+#include <os/atomic_private.h>
+#include <kern/fuxi_regtrace.h>
+extern int hz;
+#define FRT_BUCKETS 128
+#define FRT_TOP 8
+#define FRT_NAME 128
+struct frt_stat { unsigned long long n,total,max; };
+struct frt_row { char cls[FRT_NAME],key[FRT_NAME],plane[FRT_NAME];uint32_t options,apis;struct frt_stat time;uint64_t stage[3],bytes; };
+static struct frt_row frt_rows[FRT_BUCKETS],frt_top[FRT_TOP];
+static struct frt_stat frt_work,frt_drop,frt_print_work,frt_print_drop;
+static char frt_line[8192];
+static unsigned frt_enabled,frt_parsed;
+static LCK_GRP_DECLARE(frt_group,"fuxi-regtrace");
+static LCK_MTX_DECLARE(frt_lock,&frt_group);
+static void frt_add(struct frt_stat *s,uint64_t dt){s->n++;s->total+=dt;if(dt>s->max)s->max=dt;}
+uint64_t fuxi_regtrace_begin(void) {
+ if(!os_atomic_load(&frt_enabled,acquire))return 0;
+ char name[32]={0};proc_selfname(name,sizeof(name));
+ return !strcmp(name,"backboardd")?mach_absolute_time():0;
+}
+void fuxi_regtrace_phase(struct frt_token *t,unsigned phase) {
+ uint64_t now=mach_absolute_time();t->stage[t->phase]+=now-t->last;t->last=now;t->phase=phase;
+}
+void fuxi_regtrace_end(struct frt_token *t,const char *cls,const char *key,const char *plane,uint32_t options,unsigned api) {
+ uint64_t now=mach_absolute_time(),dt=now-t->start;t->stage[t->phase]+=now-t->last;
+ if(!plane || !*plane)plane="-";
+ unsigned hash=2166136261u;const char *names[]={cls,key,plane};bool fit=true;
+ for(unsigned i=0;i<3;i++){
+  size_t n=strnlen(names[i],FRT_NAME);if(n==FRT_NAME){fit=false;break;}
+  for(size_t j=0;j<=n;j++)hash=(hash^(unsigned char)names[i][j])*16777619u;
+ }
+ hash=(hash^options)*16777619u;
+ lck_mtx_lock(&frt_lock);
+ struct frt_row *r=NULL;
+ if(fit)for(unsigned i=0;i<FRT_BUCKETS;i++){
+  struct frt_row *p=&frt_rows[(hash+i)%FRT_BUCKETS];
+  if(!p->time.n){strlcpy(p->cls,cls,FRT_NAME);strlcpy(p->key,key,FRT_NAME);strlcpy(p->plane,plane,FRT_NAME);p->options=options;r=p;break;}
+  if(p->options==options && !strcmp(p->cls,cls) && !strcmp(p->key,key) && !strcmp(p->plane,plane)){r=p;break;}
+ }
+ if(r){frt_add(&r->time,dt);r->apis|=api;for(unsigned i=0;i<3;i++)r->stage[i]+=t->stage[i];if(t->bytes>r->bytes)r->bytes=t->bytes;}
+ else frt_add(&frt_drop,dt);
+ lck_mtx_unlock(&frt_lock);
+}
+void fuxi_regtrace_work_end(uint64_t *start) {
+ if(!*start)return;
+ uint64_t dt=mach_absolute_time()-*start;
+ lck_mtx_lock(&frt_lock);frt_add(&frt_work,dt);lck_mtx_unlock(&frt_lock);
+}
+static unsigned long long frt_us(uint64_t ticks){uint64_t ns;absolutetime_to_nanoseconds(ticks,&ns);return ns/1000;}
+static void frt_name(char *dst,const char *src) {
+ for(unsigned i=0;i<FRT_NAME;i++){unsigned char c=(unsigned char)src[i];dst[i]=c>32 && c<127 && c!='[' && c!=']' && c!='='?(char)c:'_';if(!c){dst[i]=0;break;}}
+}
+static void frt_report(uint64_t span) {
+ lck_mtx_lock(&frt_lock);
+ memset(frt_top,0,sizeof(frt_top));
+ for(unsigned i=0;i<FRT_BUCKETS;i++){
+  struct frt_row *r=&frt_rows[i];if(!r->time.n)continue;
+  for(unsigned j=0;j<FRT_TOP;j++)if(r->time.total>frt_top[j].time.total || !frt_top[j].time.n){
+   for(unsigned k=FRT_TOP-1;k>j;k--)frt_top[k]=frt_top[k-1];frt_top[j]=*r;break;
+  }
+ }
+ frt_print_work=frt_work;frt_print_drop=frt_drop;
+ memset(frt_rows,0,sizeof(frt_rows));memset(&frt_work,0,sizeof(frt_work));memset(&frt_drop,0,sizeof(frt_drop));
+ lck_mtx_unlock(&frt_lock);
+ size_t used=(size_t)snprintf(frt_line,sizeof(frt_line),"REGTRACE backboardd span_us=%llu dropped=%llu/%llu/%llu wi=%llu/%llu/%llu",
+  frt_us(span),frt_print_drop.n,frt_us(frt_print_drop.total),frt_us(frt_print_drop.max),frt_print_work.n,frt_us(frt_print_work.total),frt_us(frt_print_work.max));
+ for(unsigned i=0;i<FRT_TOP && frt_top[i].time.n;i++){
+  struct frt_row *r=&frt_top[i];char cls[FRT_NAME],key[FRT_NAME],plane[FRT_NAME];frt_name(cls,r->cls);frt_name(key,r->key);frt_name(plane,r->plane);
+  if(used>=sizeof(frt_line))break;
+  used+=(size_t)snprintf(frt_line+used,sizeof(frt_line)-used," [class=%s key=%s plane=%s options=0x%x apis=0x%x n=%llu total_us=%llu max_us=%llu bytes=%llu lookup_us=%llu serialize_us=%llu copy_us=%llu]",
+   cls,key,plane,r->options,r->apis,r->time.n,frt_us(r->time.total),frt_us(r->time.max),(unsigned long long)r->bytes,frt_us(r->stage[0]),frt_us(r->stage[1]),frt_us(r->stage[2]));
+ }
+ printf("%s\n",frt_line);
+}
+static void frt_worker(__unused void *arg,__unused wait_result_t wr) {
+ static int event;uint64_t before=mach_absolute_time();
+ for(;;){(void)tsleep(&event,PZERO,"fuxiregtrace",10*hz);uint64_t now=mach_absolute_time();frt_report(now-before);before=now;}
+}
+void fuxi_regtrace_start(void) {
+ if(!os_atomic_cmpxchg(&frt_parsed,0,1,relaxed))return;
+ unsigned enable=0;thread_t thread;
+ if(!PE_parse_boot_argn("fuxiregtrace",&enable,sizeof(enable)) || enable!=1)return;
+ if(kernel_thread_start(frt_worker,NULL,&thread)==KERN_SUCCESS){os_atomic_store(&frt_enabled,1,release);thread_deallocate(thread);}
+}
+#endif

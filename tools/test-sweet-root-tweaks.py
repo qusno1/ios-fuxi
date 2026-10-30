@@ -121,4 +121,128 @@ with tempfile.TemporaryDirectory() as tmp:
     except ValueError:
         pass
 
-print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs')
+
+def write_plist(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    plistlib.dump(data, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
+
+
+# Staged system apps, LaunchServices reset and os_log jobs on a synthetic root.
+with tempfile.TemporaryDirectory() as root:
+    xpc = os.path.join(root, 'System/Library/xpc/launchd.plist')
+    batteries = '/Applications/Batteries.app/PlugIns/BatteriesWidgetExtension.appex'
+    write_plist(xpc, {'LaunchDaemons': {
+        '/System/Library/LaunchDaemons/com.apple.chronod.plist': {
+            'Label': 'com.apple.chronod', 'EnvironmentVariables': {'MallocStackLoggingDirectory': '/x'}},
+        '/System/Library/LaunchDaemons/com.apple.lsd.plist': {'Label': 'com.apple.lsd'}},
+        'AppExtensions': {batteries: {'_executablePath': batteries + '/BatteriesWidgetExtension',
+                                      '_infoPlist': {'CFBundleIdentifier': 'com.apple.Batteries.BatteriesWidget'}}}})
+    widget = {'CFBundleExecutable': 'WeatherWidget', 'CFBundleIdentifier': 'com.apple.weather.widget',
+              'CFBundleName': 'WeatherWidget', 'CFBundlePackageType': 'XPC!', 'CFBundleVersion': '359',
+              'NSExtension': {'NSExtensionPointIdentifier': 'com.apple.widgetkit-extension'},
+              'NSWidgetBackgroundColorName': 'WidgetBackground', 'DTSDKBuild': '20H218',
+              'CFBundleDisplayName': 'WeatherWidget', 'UIDeviceFamily': [1, 2],
+              'CFBundleIcons': {}, 'MinimumOSVersion': '16.7'}
+    staged = os.path.join(root, m.STAGED_APPS, 'Weather.app')
+    write_plist(os.path.join(staged, 'Info.plist'), {'CFBundleIdentifier': 'com.apple.weather', 'CFBundleExecutable': 'Weather'})
+    write_plist(os.path.join(staged, 'PlugIns/WeatherWidget.appex/Info.plist'), widget)
+    write_plist(os.path.join(staged, 'Extensions/Focus.appex/Info.plist'),
+                {'CFBundleExecutable': 'Focus', 'CFBundleIdentifier': 'com.apple.weather.focus'})
+    write_plist(os.path.join(root, m.PLACEHOLDERS, 'Weather.app/Info.plist'), {'CFBundleIdentifier': 'com.apple.weather'})
+    write_plist(os.path.join(root, m.PLACEHOLDERS, 'Books.app/Info.plist'), {'CFBundleIdentifier': 'com.apple.iBooks'})
+    write_plist(os.path.join(root, m.STAGED_APPS, 'Books.app/Info.plist'), {'CFBundleIdentifier': 'com.apple.iBooks'})
+    os.makedirs(os.path.join(root, 'Applications/Books.app'))         # already present: left alone
+
+    m.install_staged_apps(root)
+    m.install_staged_apps(root)                                        # idempotent
+    assert os.path.isdir(os.path.join(root, 'Applications/Weather.app/PlugIns/WeatherWidget.appex'))
+    assert not os.path.exists(staged)
+    assert not os.path.exists(os.path.join(root, m.PLACEHOLDERS, 'Weather.app'))
+    assert os.path.isdir(os.path.join(root, m.PARKED_PLACEHOLDERS, 'Weather.app'))
+    assert os.path.isdir(os.path.join(root, m.PLACEHOLDERS, 'Books.app'))
+    assert os.path.isdir(os.path.join(root, m.STAGED_APPS, 'Books.app'))
+    cache = plistlib.load(open(xpc, 'rb'))['AppExtensions']
+    key = '/Applications/Weather.app/PlugIns/WeatherWidget.appex'
+    assert cache[key]['_executablePath'] == key + '/WeatherWidget'
+    assert cache[key]['_infoPlist'] == {k: widget[k] for k in (
+        'CFBundleExecutable', 'CFBundleIdentifier', 'CFBundleName', 'CFBundlePackageType',
+        'CFBundleVersion', 'NSExtension', 'NSWidgetBackgroundColorName')}, cache[key]['_infoPlist']
+    assert '/Applications/Weather.app/Extensions/Focus.appex' in cache and batteries in cache
+    manifest = plistlib.load(open(os.path.join(root, m.PARKED_PLACEHOLDERS, m.STAGED_MANIFEST), 'rb'))
+    assert [e['name'] for e in manifest] == ['Weather.app']
+
+    m.uninstall_staged_apps(root)
+    assert os.path.isdir(staged) and os.path.isdir(os.path.join(root, m.PLACEHOLDERS, 'Weather.app'))
+    assert not os.path.exists(os.path.join(root, 'Applications/Weather.app'))
+    assert not os.path.exists(os.path.join(root, m.PARKED_PLACEHOLDERS))
+    assert set(plistlib.load(open(xpc, 'rb'))['AppExtensions']) == {batteries}
+
+    caches = os.path.join(root, 'private/var/mobile/Containers/Data/InternalDaemon/FE51/Library/Caches')
+    os.makedirs(caches)
+    for name in ('com.apple.LaunchServices-4035-v2.csstore',
+                 'SystemDataOnly-com.apple.LaunchServices-4035-v2.csstore', 'keep.db'):
+        open(os.path.join(caches, name), 'wb').write(b'x')
+    snap = os.path.join(root, m.CHRONO_SNAPSHOTS, 'com.apple.weather.widget/com.apple.weather')
+    os.makedirs(snap)
+    open(os.path.join(snap, 'systemSmall.snapshot'), 'wb').write(b'x')
+    m.rebuild_launchservices(root)
+    assert os.listdir(caches) == ['keep.db']
+    assert os.listdir(os.path.join(root, m.CHRONO_SNAPSHOTS)) == []
+
+    m.oslog_jobs(root, ['com.apple.chronod', 'com.apple.lsd'])
+    jobs = plistlib.load(open(xpc, 'rb'))['LaunchDaemons']
+    env = jobs['/System/Library/LaunchDaemons/com.apple.chronod.plist']['EnvironmentVariables']
+    assert env == {'MallocStackLoggingDirectory': '/x', 'OS_ACTIVITY_DT_MODE': 'YES'}
+    assert jobs['/System/Library/LaunchDaemons/com.apple.lsd.plist']['EnvironmentVariables']['OS_ACTIVITY_DT_MODE'] == 'YES'
+    try:
+        m.oslog_jobs(root, ['com.apple.nonexistent'])
+        raise AssertionError('missing label accepted')
+    except SystemExit:
+        pass
+
+    m.job_env(root, ['com.apple.lsd:TU_DEBUG=sysmem'])
+    jobs = plistlib.load(open(xpc, 'rb'))['LaunchDaemons']
+    assert jobs['/System/Library/LaunchDaemons/com.apple.lsd.plist']['EnvironmentVariables']['TU_DEBUG'] == 'sysmem'
+    m.job_env(root, ['com.apple.lsd:TU_DEBUG='])
+    jobs = plistlib.load(open(xpc, 'rb'))['LaunchDaemons']
+    assert 'TU_DEBUG' not in jobs['/System/Library/LaunchDaemons/com.apple.lsd.plist']['EnvironmentVariables']
+    for bad in (['com.apple.lsd'], ['com.apple.nonexistent:A=1'], [':A=1']):
+        try:
+            m.job_env(root, bad)
+            raise AssertionError('bad spec accepted: %r' % bad)
+        except SystemExit:
+            pass
+
+with tempfile.TemporaryDirectory() as root:
+    owner = (os.getuid(), os.getgid())
+    ax = os.path.join(root, 'private/var/mobile/Library/Preferences/com.apple.Accessibility.plist')
+    m.reduce_transparency(root, False, owner)                     # absent: no file created
+    assert not os.path.exists(ax)
+    m.reduce_transparency(root, True, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'EnhancedBackgroundContrastEnabled': True}
+    assert os.stat(ax).st_mode & 0o777 == 0o600
+    d = plistlib.load(open(ax, 'rb')); d['Other'] = 1
+    plistlib.dump(d, open(ax, 'wb'), fmt=plistlib.FMT_BINARY)
+    m.reduce_transparency(root, False, owner)
+    assert plistlib.load(open(ax, 'rb')) == {'Other': 1}             # other keys kept
+
+with tempfile.TemporaryDirectory() as root:
+    assert m.mg_cache_extra(root, [m.MG_DEEP_COLOR + '=false']) is False      # absent: not created
+    path = os.path.join(root, m.MG_CACHE)
+    assert not os.path.exists(path)
+    os.makedirs(os.path.dirname(path))
+    plistlib.dump({'CacheVersion': '20H392', 'CacheData': b'x', 'CacheExtra': {'other': 1}}, open(path, 'wb'), fmt=plistlib.FMT_BINARY)
+    os.chmod(path, 0o644)
+    assert m.mg_cache_extra(root, [m.MG_DEEP_COLOR + '=false'])
+    d = plistlib.load(open(path, 'rb'))
+    assert d == {'CacheVersion': '20H392', 'CacheData': b'x', 'CacheExtra': {'other': 1, m.MG_DEEP_COLOR: False}}
+    assert os.stat(path).st_mode & 0o777 == 0o644
+    for bad in ['x', 'k=1', '=true']:
+        try:
+            m.mg_cache_extra(root, [bad])
+            raise AssertionError('bad spec accepted: %r' % bad)
+        except SystemExit:
+            pass
+
+print('PASS: cpbitmap trailer/length/pixels, legibility style, PNG decode, wallpaper files, colour wallpaper prefs, '
+      'staged apps install/undo, LaunchServices reset, oslog jobs, job env, reduce transparency, MobileGestalt CacheExtra')

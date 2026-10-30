@@ -13,6 +13,8 @@ Caches: deps/ci-downloads/; isolated build directories: deps/ci-work-TARGET/
 Requires a Mac with preinstalled Xcode 15.4 (kernel) or a selected full Xcode
 (userspace), Homebrew (prefix only; nothing is brew-installed), and rustup (metal). Kernel setup may install its KDK.
 --dry-run validates arguments and prints the plan on Linux without side effects.
+FUXI_IIG_MODE (kernel): xcode (default; Xcode 15 iig), capture (Xcode 15 iig, also
+emit iig-pregen/), replay (any Xcode; replay FUXI_IIG_CACHE or xnu/iig-pregen/).
 HELP
 }
 die() { echo "fuxi-ci: $*" >&2; exit 2; }
@@ -44,8 +46,11 @@ if [[ $# == 1 && $1 == --dry-run ]]; then dry=true; shift; fi
 [[ $# == 0 ]] || die 'unexpected arguments'
 # shellcheck source=tools/ci/pins.env
 source "$root/tools/ci/pins.env"
+iig_mode=${FUXI_IIG_MODE:-xcode}
+case "$iig_mode" in xcode|capture|replay) ;; *) die "unknown FUXI_IIG_MODE: $iig_mode" ;; esac
 if $dry; then
     printf 'target=%s\nartifact=fuxi-%s\noutput=tools/out/ci/%s\n' "$target" "$target" "$target"
+    [[ $target != kernel-* ]] || printf 'iig=%s cache=%s\n' "$iig_mode" "${FUXI_IIG_CACHE:-xnu/iig-pregen}"
     printf 'pins: dxb=%s mesa=%s metal2vulkan=%s rust=%s\n' "$DXB_SHA" "$MESA_SHA" "$M2V_SHA" "$RUST_VERSION"
     echo 'No downloads, builds, signing or packing in dry-run mode.'
     exit 0
@@ -176,8 +181,20 @@ setup() {
     xcodebuild -version
     xcrun --sdk iphoneos --show-sdk-path
     if [[ $target == kernel-* ]]; then
-        [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig'
-        xcrun --find iig
+        echo "IIG mode: $iig_mode"
+        if [[ $iig_mode == replay ]]; then
+            # Newer iig emits an IORPC ABI XNU 8796 lacks: never run it, replay
+            # hash-checked outputs of Xcode 15 iig from the same .iig inputs.
+            iig_cache=$(cd "${FUXI_IIG_CACHE:-$root/xnu/iig-pregen}" && pwd) || die 'replay needs FUXI_IIG_CACHE or xnu/iig-pregen'
+            [[ -f $iig_cache/manifest.json ]] || die "no IIG manifest in $iig_cache"
+            export IIG=$root/tools/xnu-iig-cache.py XNU_IIG_CACHE=$iig_cache
+            [[ -x $IIG ]] || die 'IIG replay script is not executable'
+            echo "IIG replay cache: $iig_cache"
+            (cd "$iig_cache" && shasum -a 256 manifest.json)
+        else
+            [[ $(xcodebuild -version | head -1) == 'Xcode 15.'* ]] || die 'XNU requires Xcode 15 iig (or FUXI_IIG_MODE=replay)'
+            xcrun --find iig
+        fi
         # The pinned builder tests xcodes even with Xcode preinstalled. Its
         # clean PATH includes this Homebrew prefix; no authentication needed.
         if ! command -v xcodes >/dev/null; then
@@ -189,9 +206,16 @@ setup() {
 
 kernel() {
     local dxb=$work/dxb variant=${target#kernel-}
+    python3 tools/test-fuxi-iig-cache.py
     python3 tools/test-fuxi-backlight.py
+    python3 tools/test-fuxi-prof.py
+    python3 tools/test-fuxi-regtrace.py
     python3 tools/test-fuxi-perf.py
     python3 tools/sync-fuxi-perf.py --check
+    python3 tools/test-fuxi-audio.py
+    python3 tools/sync-fuxi-audio.py --check
+    python3 tools/test-fuxi-pac.py
+    python3 tools/sync-fuxi-pac.py --check
     if [[ $target == kernel-wlan6g ]]; then
         # WLAN source keeps the existing artifact/target and cmdlines. Exercise the
         # exact C carried by patch 0099 before spending a hosted kernel build.
@@ -210,6 +234,7 @@ kernel() {
         python3 tools/test-fuxi-wlan-w15.py
         python3 tools/test-fuxi-wlan-w15-audit.py
         python3 tools/test-fuxi-wlan-w16.py
+        python3 tools/test-fuxi-wlan-w17.py
         python3 tools/test-fuxi-wlan-rails.py
         shasum -a 256 xnu/fuxi-wlan/fuxi_wlan.c xnu/patches/0099-fuxi-wlan.patch \
             shim/fuxi-probe/wlan.c > "$out/wlan-source-SHA256SUMS.txt"
@@ -227,6 +252,16 @@ kernel() {
     # MakeInc.kernel installs the raw linked kernel into SYMROOT *without* an
     # .unstripped suffix; give it the local packer's conventional output name.
     cp "$dxb/build/xnu.sym/kernel.development.fuxi" "$out/kernel.development.fuxi.unstripped"
+    if [[ $iig_mode != xcode ]]; then
+        # XNU-derived (APSL) generated source only: what every build directory
+        # compiled, deduplicated and checked against this build's .iig inputs.
+        python3 tools/xnu-iig-cache.py --prepare "$dxb/xnu" "$dxb/build" "$out/iig-pregen"
+        python3 tools/xnu-iig-cache.py --verify "$dxb/xnu" "$out/iig-pregen"
+        if [[ $iig_mode == replay ]]; then
+            cmp "$XNU_IIG_CACHE/manifest.json" "$out/iig-pregen/manifest.json" || die 'replayed IIG outputs differ from the cache'
+        fi
+        (cd "$out/iig-pregen" && shasum -a 256 manifest.json)
+    fi
     python3 tools/ci/kernel-inputs.py --variant "$variant" --out "$out"
 }
 
@@ -239,6 +274,11 @@ metal() {
     # NativeMetal's independent adapter keeps its existing build route.
     if [[ $target == metal ]]; then python3 tools/test-fuxi-metal-frontend.py; fi
     mesa_source # Vulkan headers from the same pinned Mesa include/ tree.
+    # Optional host Vulkan controls use a supplied local ICD and glslang, no downloads.
+    if [[ $target == metal && -n ${FUXI_MTL_TEST_ICD:-} ]]; then
+        python3 tools/test-fuxi-metal-merge.py --headers "$work/mesa/include" --icd "$FUXI_MTL_TEST_ICD" --glslang "${FUXI_MTL_TEST_GLSLANG:-glslangValidator}"
+        python3 tools/test-fuxi-metal-shadows.py --headers "$work/mesa/include" --icd "$FUXI_MTL_TEST_ICD" --glslang "${FUXI_MTL_TEST_GLSLANG:-glslangValidator}"
+    fi
     source_checkout metal2vulkan https://github.com/steelbrain/metal2vulkan.git "$M2V_SHA" "$work/metal2vulkan"
     command -v rustup >/dev/null || die 'install rustup before building metal'
     export FUXI_M2V_CACHE=$work/metal2vulkan FUXI_M2V_BRIDGE=$work/metal2vulkan-bridge
@@ -330,6 +370,8 @@ user_tools() {
     bash tools/build-fuxi-gpu-abi-test.sh
     cp tools/out/fuxi-gpu-abi-test tools/vk-smoke.conf "$out/"
     codesign --verify --strict "$out/fuxi-gpu-abi-test"
+    bash tools/build-fuxi-thermald.sh "$out"
+    cp tools/fuxi-thermald/com.fuxi.thermald.plist tools/fuxi-thermald/LICENSE.HackiOS "$out/"
     python3 tools/audit-fuxi-vulkan.py "$out/fuxi-vk-probe" "$out/fuxi-vk-smoke"
     # Audit sidecars describe only our binaries and are useful with the logs.
 }

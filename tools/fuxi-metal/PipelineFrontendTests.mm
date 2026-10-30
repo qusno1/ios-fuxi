@@ -62,7 +62,8 @@ int main() {@autoreleasepool {
   [function release];[library release];
  }
  MTLSamplerDescriptor *sd=[MTLSamplerDescriptor new];id<MTLSamplerState>sampler=[device newSamplerStateWithDescriptor:sd];
- assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=2;
+ assert(sampler && sampler.device==device);checkLabel((id)sampler);[sampler release];sd.maxAnisotropy=8;
+ sampler=[device newSamplerStateWithDescriptor:sd];assert(sampler);[sampler release];sd.maxAnisotropy=17;
  assert(![device newSamplerStateWithDescriptor:sd]);[sd release];
  FuxiTexture *t=[FuxiTexture new];t->_device=[device retain];t->_texture=new fuxi::Texture{};t->_texture->allocated=262144;t->_usage=MTLTextureUsageRenderTarget;
  FuxiPipeline *p=[FuxiPipeline new];p->_device=[device retain];p->_pipeline=new fuxi::Pipeline{};
@@ -125,7 +126,8 @@ int main() {@autoreleasepool {
  [blit copyFromTexture:(id)t sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(256,256,1)
  toBuffer:(id)b destinationOffset:256 destinationBytesPerRow:1024 destinationBytesPerImage:262144];[blit endEncoding];
  assert(c->_ops.size()==3 && c->_ops[0].texture==t->_texture && c->_ops[0].pipeline==p->_pipeline && c->_ops[2].dst==b->_buffer);
- assert(c->_resources.count==6);
+ assert(c->_resources.count==3 && c->_resourceSet.size()==3);
+ assert(c->_ops[0].diagnostic==c->_ops[1].diagnostic && !c->_ops[0].diagnostic.empty());
  // Recording snapshots the byte data and state; all bound buffers survive callers.
  FuxiBuffer *input=(FuxiBuffer *)[device newBufferWithLength:128 options:0];
  pass.colorAttachments[0].loadAction=MTLLoadActionLoad;pass.colorAttachments[0].storeAction=MTLStoreActionDontCare;
@@ -171,6 +173,10 @@ int main() {@autoreleasepool {
  assert(c->_ops.back().buffers[0][1].offset==48 && c->_ops.back().buffers[1][3].offset==64);
  assert(c->_ops.back().buffers[0][15].offset==8 && c->_ops.back().buffers[1][15].offset==16);
  assert(c->_ops.back().samples[4]==sample->_texture && c->_ops.back().samplers[15]==((FuxiSampler *)sampler)->_sampler);
+ // Repeated state/draws retain each live object once, including shared slots.
+ size_t retained=c->_resources.count;auto diagnostic=c->_ops.back().diagnostic;
+ for(unsigned i=0;i<120;++i){[r setRenderPipelineState:(id)p];[r setFragmentTexture:(id)sample atIndex:4];[r setFragmentSamplerState:sampler atIndex:15];[r setVertexBuffer:input offset:8 atIndex:15];[r drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];}
+ assert(c->_resources.count==retained && c->_resourceSet.size()==retained && c->_ops.back().diagnostic==diagnostic);
  [r setFragmentTexture:nil atIndex:4];[r setFragmentSamplerState:nil atIndex:15];
  assert(c->_ops.back().samples[4]==sample->_texture && c->_ops.back().samplers[15]==((FuxiSampler *)sampler)->_sampler);
  [r setVertexBufferOffset:80 atIndex:1];assert(c->_ops.back().buffers[0][1].offset==48);[r endEncoding];

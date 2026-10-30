@@ -25,6 +25,9 @@ BRIDGE_PATCHES = [
     '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
     '0007-accept-two-plane-rgb-surfaces.patch',
 ]
+# AdrenoMetal bridge patches 0009-0015 (MIT; metal2vulkan draw path), applied after the NativeMetal series.
+# FUXI_NATIVE_M2V_DRAW=0 leaves them out. 0008/0016 (AliasWrites policy, tile stores) are not carried: nothing selects that policy.
+M2V_DRAW_PATCHES = [] if os.environ.get('FUXI_NATIVE_M2V_DRAW') == '0' else sorted((ROOT/'tools/patches').glob('metal2vulkan-adrenometal-*.patch'))
 
 
 def run(*args, **kwargs):
@@ -81,7 +84,7 @@ def prepare(native, m2v, build):
     checkout(native, 'https://github.com/UniXNU/NativeMetal.git', PINS['NATIVEMETAL_SHA'])
     checkout(m2v, 'https://github.com/steelbrain/metal2vulkan.git', PINS['M2V_SHA'], sparse=True)
     apply_stack(native, NATIVE_PATCHES)
-    apply_stack(m2v, [native/'bridge/patches'/v for v in BRIDGE_PATCHES])
+    apply_stack(m2v, [native/'bridge/patches'/v for v in BRIDGE_PATCHES] + M2V_DRAW_PATCHES)
     build.mkdir(parents=True, exist_ok=True)
     manifest = build/'Cargo.toml'
     manifest.write_text('\n'.join([
@@ -129,7 +132,7 @@ Mac Xcode and Rust 1.98.0 required. Recipes and patches are also included.
                              (manifest, 'Cargo.toml'), (build/'Cargo.lock', 'Cargo.lock'), (notice, 'NOTICE'), (ROOT/'tools/nativemetal-rebuild.sh', 'REBUILD.sh')]:
             archive.add(source, arcname=name, filter=source_only)
         for source in [ROOT/'tools/build-fuxi-nativemetal.sh', ROOT/'tools/build-fuxi-nativemetal.py',
-                       ROOT/'tools/ci/pins.env', ROOT/'tools/fuxi-metal', *NATIVE_PATCHES]:
+                       ROOT/'tools/ci/pins.env', ROOT/'tools/fuxi-metal', *NATIVE_PATCHES, *M2V_DRAW_PATCHES]:
             archive.add(source, arcname='recipes/'+str(source.relative_to(ROOT)), filter=source_only)
         for name in ['licenses', 'COPYRIGHT-library.html', 'COPYRIGHT.html']:
             archive.add(rustdocs/name, arcname='rust-notices/'+name, filter=source_only)

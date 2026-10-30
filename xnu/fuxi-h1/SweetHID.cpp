@@ -380,6 +380,7 @@ public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 	void touch(int finger, bool down, int x, int y);
+	bool report(UInt32 mask, const int *x, const int *y);
 protected:
 	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
 	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
@@ -600,6 +601,121 @@ SweetHIDTouch::touch(int finger, bool down, int x, int y)
 	collection->release();
 }
 
+/*
+ * UniXNU/NativeHidInput ba03e5d147452b2166aab7435d219fa10877672b:
+ * dispatch a report as one collection. Identifier matching (75efe1c) is
+ * already provided by our fixed hardware-ID arrays, with no packed slots.
+ * BSD-2-Clause-Patent; notice in LICENSE.NativeHidInput beside this file.
+ * Unlike upstream we construct IOHIDEvents directly: there is no HID
+ * descriptor/parser Touch Valid bit or DigitizerCollectionDispatch property
+ * to set. Explicit Finger children, including lifts, keep their type (22f2dd4).
+ * Called only for the opt-in fuxitbatch path; touch() remains the old path.
+ * A false return requests a latest-set retry; true is not a queue-delivery ACK.
+ */
+bool
+SweetHIDTouch::report(UInt32 mask, const int *x, const int *y)
+{
+	mask &= (1u << SWEET_TOUCH_FINGERS) - 1;
+	IOFixed nx[SWEET_TOUCH_FINGERS], ny[SWEET_TOUCH_FINGERS];
+	bool edge[SWEET_TOUCH_FINGERS];
+	UInt32 old = 0, changed = 0;
+	uint64_t now = mach_absolute_time();
+
+	IOLockLock(fLock);
+	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+		UInt32 bit = 1u << i;
+		bool down = (mask & bit) != 0;
+		int px = x[i] < 0 ? 0 : (x[i] > 1079 ? 1079 : x[i]);
+		int py = y[i] < 0 ? 0 : (y[i] > 2399 ? 2399 : y[i]);
+		old |= fDown[i] ? bit : 0;
+		/* A lift keeps the last reported position, not the leave payload. */
+		nx[i] = down ? (IOFixed)(((int64_t)(px + fOffX) << 16) / fLogicalW) : fX[i];
+		ny[i] = down ? (IOFixed)(((int64_t)(py + fOffY) << 16) / fLogicalH) : fY[i];
+		edge[i] = !fDown[i] && down ?
+		    px < SWEET_TOUCH_EDGE_PX || px > 1079 - SWEET_TOUCH_EDGE_PX ||
+		    py < SWEET_TOUCH_EDGE_PX || py > 2399 - SWEET_TOUCH_EDGE_PX : fEdge[i];
+		if (fDown[i] != down || (down && (nx[i] != fX[i] || ny[i] != fY[i]))) {
+			changed |= bit;
+		}
+	}
+	if (!changed) {
+		IOLockUnlock(fLock);
+		return true;
+	}
+	IOHIDEvent *collection = IOHIDEvent::digitizerEvent(now, 0,
+	    kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+	if (!collection) {
+		IOLockUnlock(fLock);
+		return false;
+	}
+	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
+	UInt32 cmask = 0;
+	unsigned children = 0, positions = 0;
+	int64_t sx = 0, sy = 0;
+	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+		UInt32 bit = 1u << i;
+		if (!((mask | old) & bit)) {
+			continue;
+		}
+		bool down = (mask & bit) != 0, was = (old & bit) != 0;
+		IOHIDEvent *child = IOHIDEvent::digitizerEvent(now, (UInt32)i + 2,
+		    kIOHIDDigitizerTransducerTypeFinger, down, down ? 1 : 0, nx[i], ny[i]);
+		if (!child) {
+			collection->release();
+			IOLockUnlock(fLock);
+			return false; /* Do not publish a partial set or advance its state. */
+		}
+		UInt32 events = edge[i] ? kIOHIDDigitizerEventFromEdgeTip : 0;
+		if (was != down) {
+			events |= kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventRange;
+		}
+		if (down && (nx[i] != fX[i] || ny[i] != fY[i])) {
+			events |= kIOHIDDigitizerEventPosition;
+		}
+		if (!was && down) {
+			events |= kIOHIDDigitizerEventIdentity;
+		}
+		child->setIntegerValue(kIOHIDEventFieldDigitizerIndex, i);
+		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
+		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, down);
+		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, events);
+		collection->appendChild(child);
+		child->release();
+		if (!collection->getChildren() || collection->getChildren()->getCount() != ++children) {
+			collection->release();
+			IOLockUnlock(fLock);
+			return false;
+		}
+		cmask |= events;
+		if (down || !mask) {
+			sx += nx[i];
+			sy += ny[i];
+			positions++;
+		}
+	}
+	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+		bool down = (mask & (1u << i)) != 0;
+		if (fDown[i] != down) {
+			IOLog("SWEET HID: touch %d %s at %d,%d%s\n", i, down ? "down" : "up",
+			    x[i], y[i], edge[i] ? " edge" : "");
+		}
+		fDown[i] = down;
+		fEdge[i] = edge[i];
+		fX[i] = nx[i];
+		fY[i] = ny[i];
+	}
+	collection->setFixedValue(kIOHIDEventFieldDigitizerX, (IOFixed)(sx / positions));
+	collection->setFixedValue(kIOHIDEventFieldDigitizerY, (IOFixed)(sy / positions));
+	collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, mask != 0);
+	collection->setIntegerValue(kIOHIDEventFieldDigitizerTouch, mask != 0);
+	collection->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, cmask);
+	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, mask ? 1 : 0);
+	IOLockUnlock(fLock);
+	dispatchEvent(collection);
+	collection->release();
+	return true;
+}
+
 /* Time of the latest key or touch report, read by the fuxiautolock thread
  * in bsd/dev/fuxi_keys.c. */
 extern "C" { uint64_t sweet_hid_last_input; }
@@ -638,4 +754,14 @@ sweet_hid_touch(int finger, int down, int x, int y)
 	if (gSweetTouch) {
 		gSweetTouch->touch(finger, down != 0, x, y);
 	}
+}
+
+extern "C" int
+sweet_hid_touch_report(uint32_t mask, const int *x, const int *y)
+{
+	__atomic_store_n(&sweet_hid_last_input, mach_absolute_time(), __ATOMIC_RELAXED);
+	if (gSweetTouch) {
+		return gSweetTouch->report(mask, x, y);
+	}
+	return 0;
 }

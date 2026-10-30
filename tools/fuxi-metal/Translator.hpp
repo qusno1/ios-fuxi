@@ -1,7 +1,9 @@
 /* Original dynamic boundary. The translator and all its dependencies stay external. */
 #pragma once
 #include <cstddef>
+#include <cstring>
 #include "ConstantLayout.hpp"
+#include "ShadowRanges.hpp"
 #include "CAState.hpp"
 #include "TranslationPolicy.hpp"
 #include <cstdint>
@@ -21,12 +23,15 @@ struct ColorOptions {
  uint32_t format=0,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15;
 };
 struct ColorBlend {uint32_t blend{},mask{},factors[6]{};};
+// DeviceFeature bits: 1 shaderFloat16, 2 storageBuffer16BitAccess, 4 uniformAndStorageBuffer16BitAccess, 8 shaderInt16, 16 robustBufferAccess, 32 robustBufferAccess2, 64 robustImageAccess2.
+enum DeviceFeature : uint32_t {featFloat16=1,featStorage16=2,featUniform16=4,featInt16=8,featRobustBuffer=16,featRobustBuffer2=32,featRobustImage2=64};
 struct CompileOptions {
  uint32_t format=80,blend=0,srcRGB=1,dstRGB=0,rgbOp=0,srcAlpha=1,dstAlpha=0,alphaOp=0,mask=15,strip=0;
  Attribute attributes[8]{};uint32_t strides[4]{};uint32_t constantCount[2]{};Constant constants[2][maxFunctionConstants]{};
  // Actual VkDevice enables, supplied by Backend; never inferred from support.
  uint32_t orderedColorAccess{};
  uint32_t independentBlend{};uint32_t colorCount=1;ColorOptions colors[7]{};
+ uint32_t deviceFeatures{}; // bitmask of the extra VkDevice enables below; must equal the VkFeature set the bridge gives metal2vulkan
  ColorOptions color(unsigned i) const {return i?colors[i-1]:ColorOptions{format,blend,srcRGB,dstRGB,rgbOp,srcAlpha,dstAlpha,alphaOp,mask};}
 };
 struct Descriptor {uint32_t binding{},type{},stages{},slot{},sampler{},format{},components[4]{};uint64_t offset{},range{};uint32_t set{},source{};};
@@ -34,8 +39,24 @@ struct VertexBinding {uint32_t binding{},slot{},stride{};};
 struct VertexAttribute {uint32_t location{},binding{},format{},offset{};};
 struct BoundBuffer {uint64_t length{},offset{};uint32_t bytes{};};
 struct DrawInput {BoundBuffer buffers[2][resourceSlots]{};uint32_t formats[resourceSlots]{},filters[resourceSlots]{};float lodMin[resourceSlots]{},lodMax[resourceSlots]{};uint32_t count{},start{},indexed{},strip{};uint64_t indexLength{},indexOffset{};};
+// Compare every ABI input field, without struct padding or float arithmetic.
+// The draw planner reads only these values and the immutable product. Buffer
+// contents, image layouts and resource identity are validated by Backend later.
+inline bool sameDrawInput(const DrawInput &a,const DrawInput &b) {
+ if(a.count!=b.count || a.start!=b.start || a.indexed!=b.indexed || a.strip!=b.strip || a.indexLength!=b.indexLength || a.indexOffset!=b.indexOffset)return false;
+ for(unsigned i=0;i<resourceSlots;++i){
+  if(a.formats[i]!=b.formats[i] || a.filters[i]!=b.filters[i] || memcmp(&a.lodMin[i],&b.lodMin[i],sizeof(float)) || memcmp(&a.lodMax[i],&b.lodMax[i],sizeof(float)))return false;
+  for(unsigned stage=0;stage<2;++stage){auto &x=a.buffers[stage][i];auto &y=b.buffers[stage][i];if(x.length!=y.length || x.offset!=y.offset || x.bytes!=y.bytes)return false;}
+ }
+ return true;
+}
 struct Push {uint32_t offset{},size{},stages{};uint8_t bytes[128]{};};
 struct DrawOutput {uint32_t descriptorCount{},pushCount{},vertexCount{},indexed{},count{},first{};uint64_t indexOffset{};Descriptor descriptors[16]{};Push pushes[2]{};uint32_t vertexBindings[4]{},vertexSlots[4]{};uint64_t vertexOffsets[4]{};};
+// Optional ABI-8 extension, emitted by our bridge from public pipeline/plan metadata.
+struct DrawBufferRebase {uint32_t active{},stage{},slot{},whole{};int64_t start{};uint64_t size{},alignment{},maxRange{};};
+struct DrawPushRebase {uint32_t push{},offset{},kind{},source{};}; // residual descriptor, guest slot, draw base
+struct DrawRebase {uint32_t enabled{},pushCount{};DrawBufferRebase buffers[16]{};DrawPushRebase pushes[64]{};};
+static_assert(sizeof(DrawBufferRebase)==48 && sizeof(DrawRebase)==1800,"draw rebase ABI");
 struct Specialization {uint32_t id{},offset{},size{};};
 struct Range {uint32_t offset{},size{},stages{};};
 struct BakedSampler {uint32_t enabled{},mag{},min{},mip{},address[3]{};float bias{},minLod{},maxLod{};uint32_t border{};};
@@ -77,10 +98,13 @@ public:
  int (*function)(void *,const char *,char *,size_t){};
  int (*compile)(void *,const char *,void *,const char *,void *,uint64_t,uint64_t,const CompileOptions *,Translation *,char *,size_t){};
  int (*draw)(void *,const DrawInput *,DrawOutput *,char *,size_t){};
+ int (*draw_plan)(void *,const DrawInput *,DrawOutput *,DrawRebase *,char *,size_t){};
+ int planDraw(void *p,const DrawInput *i,DrawOutput *o,DrawRebase *r,char *why,size_t cap){*r={};return draw_plan && !systemTranslationPolicy().trace?draw_plan(p,i,o,r,why,cap):draw(p,i,o,why,cap);}
  int (*variant)(void *,const DrawInput *,Translation *,char *,size_t){};
  int (*sampler)(void *,uint32_t,BakedSampler *,char *,size_t){};
  int (*identity)(void *,const char *,void *,const char *,const CompileOptions *,uint8_t *,char *,size_t){};
  int (*product_hash)(void *,uint8_t *){};
+ int (*shadow_windows)(void *,ShadowWindow *){}; // Optional immutable access proof; absent means whole buffers.
  uint32_t (*texture_type)(void *,uint32_t){}; // Optional ABI-8 reflected Metal type; UINT32_MAX means unused.
  void (*free)(void *){};
  Translator() {
@@ -91,6 +115,8 @@ public:
 #define LOAD(n) n=(decltype(n))dlsym(dylib,"fuxi_m2v_" #n);if(!n) {dlclose(dylib);throw std::runtime_error("missing translator " #n);}
   LOAD(open) LOAD(close) LOAD(function) LOAD(compile) LOAD(draw) LOAD(variant) LOAD(sampler) LOAD(identity) LOAD(product_hash) LOAD(free)
 #undef LOAD
+  draw_plan=(decltype(draw_plan))dlsym(dylib,"fuxi_m2v_draw_plan_v1");
+  shadow_windows=(decltype(shadow_windows))dlsym(dylib,"fuxi_m2v_shadow_windows_v1");
   texture_type=(decltype(texture_type))dlsym(dylib,"fuxi_m2v_texture_type");
   translationScope=(TranslationScope)dlsym(dylib,"fuxi_m2v_translation_scope_v1");
   auto policy=systemTranslationPolicy();if(policy.stages || policy.trace)fprintf(stderr,"FUXI MTL: translation settings stages=%u trace=%u bridge=%u\n",unsigned(policy.stages),unsigned(policy.trace),unsigned(translationScope!=nullptr));

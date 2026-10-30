@@ -1,0 +1,26 @@
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -96,6 +96,9 @@
+ #include <os/atomic_private.h>
+ 
+ #include <sys/paths.h>
++#if defined(FUXI)
++#include "fuxi_unixnu_lookup.h"
++#endif
+ 
+ #if NAMEDRSRCFORK
+ #include <sys/xattr.h>
+@@ -1512,7 +1515,12 @@
+ 	nd.ni_dvp = dvp->v_mount->mnt_vnodecovered;
+ 	error = namei(&nd);
+ 	if (error == 0) {
+-		*new_dvp = nd.ni_vp;
++#if defined(FUXI)
++		error = fuxi_unixnu_lower_directory(nd.ni_vp);
++#endif
++		if (error == 0) {
++			*new_dvp = nd.ni_vp;
++		}
+ 	}
+ 	nameidone(&nd);
+ done:

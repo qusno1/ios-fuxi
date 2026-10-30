@@ -8,7 +8,7 @@ static fuxi::Operation alias(fuxi::Texture *t,unsigned width,unsigned height){
 int main(){
  using namespace fuxi;
  assert(systemTranslationPolicy().frameTrace);bool reuse=systemTranslationPolicy().pipelined;
- Backend backend;auto baseline=backend.resourceBytes();auto objects=liveMemoryObjects.load();
+ Backend backend;backend.buffersPooled=false;auto baseline=backend.resourceBytes();auto objects=liveMemoryObjects.load();
  auto *t=backend.allocateTexture(80,5,1024,512);auto *up=backend.allocate(1024*512*4),*out=backend.allocate(1024*512*4);
  for(size_t i=0;i<up->length;++i)((uint8_t *)up->contents)[i]=uint8_t(i*13%251);
  Operation upload{};upload.texture=t;upload.src=up;upload.upload=true;
@@ -24,7 +24,9 @@ int main(){
   auto overlapping=alias(t,128,128);overlapping.srcX=i;overlapping.dstX=i+1;overlapping.dstY=1;
   {FrameTraceScope scope(&s);backend.submit({upload,overlapping,read});}
   assert(!memcmp(out->contents,expected.data(),expected.size()));
-  assert(!s.draws && !s.passes && s.backendSubmit && s.gpuWait);prepare+=s.backendSubmit;
+  assert(!s.draws && !s.passes && s.backendSubmit && s.gpuWait);
+  assert(bool(s.backendCPU)==systemTranslationPolicy().frameCPU);
+  assert(s.record && s.kernelIO && s.queueSubmit && !s.recordCPU && !s.kernelIOCPU && !s.queueSubmitCPU);prepare+=s.backendSubmit;
   if(backend.supportsTimestamps())assert(s.gpuExec);
   assert(backend.resourceBytes()==charged+(reuse?65536:0));
  }
@@ -44,7 +46,13 @@ int main(){
  Operation clear{};clear.texture=t;clear.clearOnly=true;clear.clear[3]=1;clear.areaWidth=512;
  FrameSample render;{FrameTraceScope scope(&render);backend.submit({clear});}assert(render.passes==1 && !render.draws);
  FrameSample empty;{FrameTraceScope scope(&empty);backend.submit({});}assert(!empty.gpuWait && !empty.gpuExec && !empty.passes);
- backend.destroy(t);backend.destroy(up);backend.destroy(out);
+ // Async retirement must not extend submit-thread CPU time through the fence.
+ FrameSample deferred;std::function<void()> retire;
+ {FrameTraceScope scope(&deferred);backend.submit({upload,read},{},&retire);}
+ auto submittedCPU=deferred.backendCPU;assert(retire && bool(submittedCPU)==systemTranslationPolicy().frameCPU && !deferred.gpuWait);
+ std::thread retireWorker([&]{FrameTraceScope scope(&deferred);retire();});retireWorker.join();
+ assert(deferred.backendCPU==submittedCPU && deferred.gpuWait);
+ backend.destroy(t);backend.destroy(up);backend.destroy(out);backend.trimMemory();
  assert(backend.resourceBytes()==baseline+(reuse?262144:0));backend.close();
  assert(liveMemoryObjects==objects); // retained scratch is reclaimed on clean close
  {

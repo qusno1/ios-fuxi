@@ -32,11 +32,13 @@ using task_t=unsigned;using IOOptionBits=unsigned;
 constexpr task_t kernel_task=99;
 constexpr int kIOReturnSuccess=0,kIOReturnBadArgument=1,kIOReturnNoResources=2,
  kIOReturnNoMemory=3,kIOReturnBusy=4,kIOReturnIOError=5;
-constexpr unsigned kIODirectionNone=0,kIODirectionInOut=3,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
+constexpr unsigned kIODirectionNone=0,kIODirectionIn=1,kIODirectionOut=2,kIODirectionInOut=3,kIOMapReadOnly=4096,kIOMemoryMapperNone=8,kIOMemoryPersistent=16,
  kIOMapAnywhere=32,kIOMapDefaultCache=0;
 #define bzero(p,n) memset(p,0,n)
 static task_t caller=7;
 static task_t current_task() {return caller;}
+static int roEnabled;static unsigned lastPrepareDir,lastMapRo,wireOut;
+static int fuxi_gpu_abi_roimport() {return roEnabled;}
 static unsigned descriptors,maps,completes,prepares,fail,unmaps,waits;
 static bool busy,undrained;
 static bool connected=true;
@@ -48,7 +50,8 @@ static void abiTrace(const char *,int,int){}
 static bool pmap_valid_page(ppnum_t p) {return p!=0x12345;}
 constexpr unsigned VM_WIMG_MASK=255,VM_WIMG_DEFAULT=2,VM_WIMG_WCOMB=6;
 static unsigned hostCache=VM_WIMG_DEFAULT;
-static unsigned pmap_cache_attributes(ppnum_t) {return fail==12?7:hostCache;}
+static unsigned pmap_cache_attributes(ppnum_t p) {return fail==12 || (fail==16 && p==(0x10000000>>14)+1)?7:hostCache;}
+static unsigned segLookups;
 struct IOMemoryMap;
 struct IOMemoryDescriptor {
  unsigned refs=1,wired=0;uint64_t length=0;
@@ -57,17 +60,19 @@ struct IOMemoryDescriptor {
  void retain() {refs++;}
  void release() {assert(refs);if(!--refs)delete this;}
  static IOMemoryDescriptor *withAddressRange(uint64_t a,uint64_t n,unsigned options,task_t task) {
-  assert(task==7 && options==(kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent));
+  assert(task==7 && (options==(kIODirectionInOut|kIOMemoryMapperNone|kIOMemoryPersistent) || options==(kIODirectionOut|kIOMemoryMapperNone|kIOMemoryPersistent)));
   // Model holes, inaccessible/read-only mappings and entry allocation failure.
-  if(fail==1 || a!=0x100000)return nullptr;
+  if(fail==1 || a<0x100000)return nullptr;
+  if(fail==17 && (options&3)==kIODirectionInOut)return nullptr; // read-only region: write access refused
+  if(fail==18 && n>16384)return nullptr; // hole in the middle
   auto *m=new IOMemoryDescriptor;m->length=n;return m;
  }
- IOReturn prepare() {prepares++;if(fail==2)return kIOReturnBadArgument;wired++;return 0;}
+ IOReturn prepare(unsigned dir=kIODirectionInOut) {lastPrepareDir=dir;prepares++;if(fail==2)return kIOReturnBadArgument;wired++;return 0;}
  IOReturn complete() {assert(wired);wired--;completes++;return 0;}
  uint64_t getLength() {return fail==3?length-1:length;}
  uint64_t getPhysicalSegment(uint64_t off,IOByteCount *n,unsigned flags) {
   assert(wired && flags==kIOMemoryMapperNone && !(off&16383));
-  *n=fail==4?4096:16384;
+  segLookups++;*n=fail==4?4096:(fail==15||fail==16)?length-off:16384;
   if(fail==5 && off==16384)return 0; // unwind a partially walked scatter list
   if(fail==6)return UINT64_C(1)<<36;
   if(fail==7)return 0x12345ULL<<14; // foreign/device page
@@ -77,11 +82,11 @@ struct IOMemoryDescriptor {
  IOMemoryMap *createMappingInTask(task_t,uint64_t,unsigned);
 };
 struct IOMemoryMap {
- IOMemoryDescriptor *md;bool wired=false;
- IOMemoryMap(IOMemoryDescriptor *m):md(m) {maps++;md->retain();}
+ IOMemoryDescriptor *md;bool wired=false,ro=false;
+ IOMemoryMap(IOMemoryDescriptor *m,bool r=false):md(m),ro(r) {maps++;md->retain();}
  int wireRange(unsigned options,uint64_t off,uint64_t n) {
   assert(!off && n==md->length);
-  if(options==kIODirectionInOut) {assert(!wired);if(fail==13)return 1;wired=true;}
+  if(options==kIODirectionInOut || options==kIODirectionIn) {assert(!wired);if(fail==13||(ro&&(options&kIODirectionOut)))return 1;wired=true;wireOut+=options==kIODirectionIn;}
   else {assert(!options && wired);if(fail==14)return 1;wired=false;}
   return 0;
  }
@@ -90,8 +95,9 @@ struct IOMemoryMap {
  uint64_t getLength() {return fail==11?md->length-1:md->length;}
 };
 IOMemoryMap *IOMemoryDescriptor::createMappingInTask(task_t task,uint64_t a,unsigned options) {
- assert(wired && task==kernel_task && !a && options==(kIOMapAnywhere|kIOMapDefaultCache));
- return fail==9?nullptr:new IOMemoryMap(this);
+ assert(wired && task==kernel_task && !a && (options&~kIOMapReadOnly)==(kIOMapAnywhere|kIOMapDefaultCache));
+ lastMapRo=!!(options&kIOMapReadOnly);
+ return fail==9?nullptr:new IOMemoryMap(this,!!(options&kIOMapReadOnly));
 }
 struct IOBufferMemoryDescriptor {void release(){assert(false);}};
 struct FuxiAdrenoBoView {void release(){assert(false);}};
@@ -131,6 +137,23 @@ int main() {
   assert(c.importHost(request,out)!=0 && !out.handle && !c.wired_ && !c.bos_[0].handle);
   empty();assert(completes==before+(fail>=3));
  }
+ // One physical segment lookup per contiguous run, but the cache-class predicate still applies to every 16K page of the run.
+ fail=15;segLookups=0;
+ assert(!c.importHost(request,out) && segLookups==1 && c.wired_==32768);fail=0;assert(!c.drop(c.bos_[0]));empty();
+ request.bytes=65536;fail=15;segLookups=0;
+ assert(!c.importHost(request,out) && segLookups==1);fail=0;assert(!c.drop(c.bos_[0]));empty();
+ request.bytes=32768;fail=16;segLookups=0;unsigned before_=completes;
+ assert(c.importHost(request,out)!=0 && segLookups==1 && !c.wired_ && !c.bos_[0].handle);empty();assert(completes==before_+1);
+ fail=0;
+ // Read-only region: refused with the probe bitmap unless bit 1024 enables the read-only import.
+ out={};fail=17;roEnabled=0;assert(c.importHost(request,out)==kIOReturnNoMemory && !out.handle && !c.wired_);empty();
+ fail=18;assert(c.importHost(request,out)==kIOReturnNoMemory);empty();
+ fail=17;roEnabled=1;lastMapRo=0;wireOut=0;
+ assert(!c.importHost(request,out) && out.handle && c.bos_[0].importRo && lastPrepareDir==kIODirectionOut && lastMapRo && wireOut==1);
+ fail=0;assert(!c.drop(c.bos_[0]));empty();
+ fail=18;assert(c.importHost(request,out)==kIOReturnNoMemory);empty();
+ roEnabled=0;fail=0;lastMapRo=1;
+ assert(!c.importHost(request,out) && !c.bos_[0].importRo && lastPrepareDir==kIODirectionInOut && !lastMapRo);assert(!c.drop(c.bos_[0]));empty();
  fail=0;caller=8;assert(c.importHost(request,out)==kIOReturnBadArgument);empty();caller=7;
  c.task_=kernel_task;assert(c.importHost(request,out)==kIOReturnBadArgument);c.task_=7;
  c.wired_=FG_ABI_MAX_WIRED_BYTES-16384;assert(c.importHost(request,out)==kIOReturnNoResources);c.wired_=0;
@@ -179,16 +202,27 @@ int main() {
 '''
 
 
+HANDLE_STUBS = r'''
+#include <new>
+#include <cstddef>
+#define IONewZero(T,n) (new (std::nothrow) T[n]())
+#define IODelete(p,T,n) delete[] (p)
+static unsigned peakBos;
+#include "FuxiHandleIndex.h"
+'''
+
+
 def main():
     source = (ROOT/'xnu/fuxi-adreno/FuxiAdrenoUserClient.cpp').read_text()
     helper = (ROOT/'xnu/fuxi-adreno/fuxi_adreno_host.c').read_text()
     helper = helper[helper.index('bool fuxi_adreno_host_page_ok('):helper.index('#endif')]
     bo = source[source.index(' struct Bo {'):source.index(' task_t task_')]
     close = method(source, 'clientClose').replace(' override', '').replace('openLock);', '&openLock);')
-    model = PREFIX + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
+    model = PREFIX + HANDLE_STUBS + helper + 'struct Client {\n enum {MaxBos=FG_ABI_MAX_BOS};\n' + bo + r'''
  /* The kernel allocates the table in initWithTask; the model owns it inline. */
  Bo storage_[MaxBos]={};
- Client(){bos_={storage_,storage_+MaxBos};}
+ Client(){bos_={storage_,storage_+MaxBos};assert(index_.allocate());}
+ ~Client(){index_.release();}
  task_t task_=7;uint64_t nextHandle_=1,wired_=0,lastFence_=1;
  int *lock_=&clientLock;bool live_=true;int pid_=0;
  void terminate(){}

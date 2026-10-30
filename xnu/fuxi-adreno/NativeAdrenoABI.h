@@ -12,7 +12,7 @@
  * rather than ignored. */
 enum {
     NativeAdrenoAbiVersion = 2,
-    NativeAdrenoAbiMaxBuffers = 16,
+    NativeAdrenoAbiMaxBuffers = 128,   /* a frame's IBs in one atomic submission (Adreno740 MIT); 16 before */
     NativeAdrenoAbiHostPageBytes = 16384,
     NativeAdrenoAbiMaxBoBytesShift = 28, /* 256MiB per object */
     NativeAdrenoMethodQuery = 1,
@@ -42,8 +42,14 @@ struct NativeAdrenoAbiParams {
     uint64_t max_bo_bytes;
 };
 enum {
-    NativeAdrenoParamsHostImport = 1  /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsHostImport = 1, /* BoImport pins the caller's own pages (an IOSurface's) as a BO */
+    NativeAdrenoParamsImportGpuOnly = 2 /* BoMap accepts NativeAdrenoMapGpuOnly in `reserved` for an imported BO */
 };
+/* BoMap.reserved bits (zero keeps the old behaviour, every other bit is refused). NativeAdrenoMapGpuOnly: the caller promises that no CPU
+ * thread reads or writes the imported range from this map until BoFree/unmap (Metal storageModePrivate textures and buffers, private
+ * render targets). The kernel then cleans the range once at map, skips the per-submit clean and the retirement invalidate, and
+ * invalidates it once at unmap. Ignored for allocated BOs. A kernel that does not report NativeAdrenoParamsImportGpuOnly refuses it. */
+enum { NativeAdrenoMapGpuOnly = 1 };
 struct NativeAdrenoAbiBoAlloc {
     uint64_t bytes;               /* 4KiB multiple, <= max_bo_bytes */
     uint32_t align_log2;          /* 12..24 */
@@ -56,6 +62,10 @@ struct NativeAdrenoAbiBoAllocReply {
  * call BoImport). Reply is NativeAdrenoAbiBoAllocReply. The original CPU cache
  * policy is preserved; no CPU-map token is issued. Kernel cleans/invalidates
  * imported mappings before submit and invalidates after retirement/drain.
+ * fuxigpuncimport is a bitmask: bit 0 (1) cleans GPU-writable imports once at map time (below);
+ * bit 1 (2) writes CP_RB_WPTR as a fenced register; bit 2 (4) recovers a stalled job (see docs-lanes/unixnu-port.md).
+ * With bit 0 it requires NO CPU writes until unmap, including between submissions.
+ * Completion/drained-fault invalidation is retained for CPU readers.
  * GPU access uses Normal NC, outer-shareable SMMU leaves. Caller must keep the
  * original allocation alive and externally synchronize CPU/other GPU access.
  * BoFree/task death unmaps and unwires after DMA retirement, or quarantines on
@@ -70,7 +80,7 @@ struct NativeAdrenoAbiBoMap {
     uint32_t permissions;         /* bit0 read, bit1 write; read required */
     uint32_t writeback;           /* 0 normal non-coherent, 1 WB/WA */
     uint32_t shareability;        /* 2 outer, 3 inner */
-    uint32_t reserved;            /* zero */
+    uint32_t reserved;            /* zero, or NativeAdrenoMapGpuOnly */
 };
 struct NativeAdrenoAbiBoMapReply {
     uint64_t iova;
@@ -157,7 +167,7 @@ static_assert(sizeof(NativeAdrenoAbiBoAlloc) == 16, "ABI alloc layout");
 static_assert(sizeof(NativeAdrenoAbiBoMap) == 32, "ABI map layout");
 static_assert(sizeof(NativeAdrenoAbiBoImport) == 16, "ABI import layout");
 static_assert(sizeof(NativeAdrenoAbiSubmitBuffer) == 24, "ABI buffer layout");
-static_assert(sizeof(NativeAdrenoAbiSubmit) == 416, "ABI submit layout");
+static_assert(sizeof(NativeAdrenoAbiSubmit) == 32 + 24 * NativeAdrenoAbiMaxBuffers, "ABI submit layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMap) == 8, "ABI cpu map layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuMapReply) == 16, "ABI cpu map reply layout");
 static_assert(sizeof(NativeAdrenoAbiBoCpuUnmap) == 16, "ABI cpu unmap layout");
