@@ -343,10 +343,12 @@ def main():
     thermal_file = (args.out / 'thermal.jsonl').open('w') if args.thermal_log else None
     last_total = 0
     previous = None
+    monitor_failures = 0
     until = time.monotonic() + args.seconds
     renew = time.monotonic() + 600
     with (args.out / 'progress.jsonl').open('w') as progress, (args.out / 'boot.log').open('wb') as log:
         while time.monotonic() < until:
+          try:  # vermeer: tolerate transient USB stalls
             status = monitor()
             if status['stage'] == 99:
                 status['error'] = request(0x48, 128).split(b'\0', 1)[0].decode(errors='replace')
@@ -399,21 +401,31 @@ def main():
                 request(0x54, 8, args.reset_minutes)
                 renew = time.monotonic() + 600
             time.sleep(.25)
+          except usb.core.USBError as e:
+            monitor_failures += 1
+            print(f'usb error #{monitor_failures}: {e}', flush=True)
+            if monitor_failures > 60:
+                print('too many USB failures, giving up', flush=True)
+                break
+            time.sleep(2)
+            continue
+          monitor_failures = 0
     (args.out/'display-after.bin').write_bytes(request(0x42,432))
     if args.framebuffer:
+        FBW,FBH,FBSTRIDE=1440,3200,5760  # vermeer panel (fuxi was 1080x2400)
         raw=bytearray()
-        for off in range(0,1080*2400*4,512):
-            raw.extend(request(0x4e,min(512,1080*2400*4-off),off&0xffff,off>>16))
+        for off in range(0,FBW*FBH*4,512):
+            raw.extend(request(0x4e,min(512,FBW*FBH*4-off),off&0xffff,off>>16))
         (args.out/'framebuffer.bgra').write_bytes(raw)
         rows=[]
-        for y in range(2400):
-            line=raw[y*4320:(y+1)*4320]
-            rgb=bytearray(1080*3)
+        for y in range(FBH):
+            line=raw[y*FBSTRIDE:(y+1)*FBSTRIDE]
+            rgb=bytearray(FBW*3)
             rgb[0::3],rgb[1::3],rgb[2::3]=line[2::4],line[1::4],line[0::4]
             rows.append(b'\0'+rgb)
         def chunk(kind,data):
             return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
-        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',1080,2400,8,2,0,0,0))
+        png=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',FBW,FBH,8,2,0,0,0))
         png+=chunk(b'IDAT',zlib.compress(b''.join(rows),6))+chunk(b'IEND',b'')
         (args.out/'framebuffer.png').write_bytes(png)
         print('Saved framebuffer memory; physical panel output still needs confirmation',flush=True)
