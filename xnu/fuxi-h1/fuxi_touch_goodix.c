@@ -60,6 +60,27 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 #define GX_PRIORITY  92            /* BASEPRI_PREEMPT, as the FTS driver */
 #define GX_MAX       10u
 
+/* GPI DMA layout: identical to fuxi_touch.c (the same 16 KiB DMA page). */
+#define GX_EV_OFF    0x0000u
+#define GX_RING_OFF(k) (0x1000u + 0x400u * (k))
+#define GX_TXB_OFF   0x1800u
+#define GX_RXB_OFF   0x1c00u
+#define GX_RING      64u
+#define GX_EVRING    256u
+#define GPI_CH(k)    (0x0000u + 0x80u * (k))
+#define GPI_EV       0x1000u
+#define GPI_CHDB(k)  (0x2000u + 8u * (k))
+#define GPI_EVDB     0x2100u
+#define GPI_GPII     0x3000u
+
+/* I2C GO/DMA TRE flags (Linux gpi.c). */
+#define GX_TRE_TYPE_GO   0x20u
+#define GX_TRE_TYPE_DMA  0x10u
+#define GX_TRE_FLAGS_CHAIN (1u << 0)
+#define GX_TRE_FLAGS_IEOT  (1u << 9)
+#define GX_GO_FLAGS  (GX_TRE_TYPE_GO << 16 | GX_TRE_FLAGS_CHAIN)
+#define GX_DMA_FLAGS (GX_TRE_TYPE_DMA << 16 | GX_TRE_FLAGS_IEOT)
+
 /* GENI serial engine registers (UniXNU GeniI2c.h, BSD-2-Clause-Patent). */
 #define GENI_FW_REVISION 0x068u
 #define GENI_IF_DISABLE  0x064u
