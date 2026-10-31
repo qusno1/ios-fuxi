@@ -10,9 +10,11 @@
  *   -[_LSInstallProgressService performJournalRecovery]
  *   -[_LSInstallProgressService dispatchJournalledNotificationsToConnectedClients]
  *
- * Built by tools-bin/mkdylib.py (bare Mach-O, ad-hoc signed, no Apple
- * toolchain) and installed into lsd's job EnvironmentVariables as
- * DYLD_INSERT_LIBRARIES=/usr/local/lib/fuxi/libfuxi-lsd-bypass.dylib.
+ * Timing: our dylib links only libobjc, so its constructor runs BEFORE
+ * CoreServices initialises and registers its ObjC classes — objc_getClass
+ * returns NULL there (seen on device: FUXI_BYPASS_NO_CLASS). Instead the
+ * constructor starts a poller thread that swizzles the moment the class
+ * appears, which is still before lsd's main runs the recovery.
  */
 
 typedef struct objc_object *id;
@@ -25,14 +27,10 @@ extern SEL sel_registerName(const char *name);
 extern void *class_getInstanceMethod(Class cls, SEL sel);
 extern IMP method_getImplementation(void *method);
 extern IMP method_setImplementation(void *method, IMP imp);
-extern const char *class_getName(Class cls);
-extern id objc_msgSend(id self, SEL op, ...);
-extern void *objc_getProtocol(const char *name);
 extern long write(int fd, const void *buf, unsigned long count);
-
-typedef unsigned long u64;
-
-__attribute__((used)) static char shim_log_buf[128];
+extern void usleep(unsigned usec);
+extern long pthread_create(unsigned long *t, const void *attr, void *(*fn)(void *), void *arg);
+extern void pthread_exit(void *);
 
 #define SHIM_LOG(s) write(2, s, sizeof(s) - 1)
 
@@ -46,20 +44,8 @@ static id stub_recover(id self, SEL _cmd)
 	return (id)0;
 }
 
-static Class find_cls(const char *name)
+static void swizzle(Class c)
 {
-	return (Class)objc_getClass(name);
-}
-
-__attribute__((constructor))
-static void shim_init(void)
-{
-	SHIM_LOG("FUXI_BYPASS_LOADED\n");
-	Class c = find_cls("LSInstallProgressService");
-	if (c == (Class)0) {
-		SHIM_LOG("FUXI_BYPASS_NO_CLASS\n");
-		return;   /* not lsd; nothing to do */
-	}
 	SEL s1 = sel_registerName("performJournalRecovery");
 	SEL s2 = sel_registerName("dispatchJournalledNotificationsToConnectedClients");
 	void *m1 = class_getInstanceMethod(c, s1);
@@ -72,5 +58,37 @@ static void shim_init(void)
 		orig_dispatch_journal = method_getImplementation(m2);
 		method_setImplementation(m2, (IMP)stub_recover);
 	}
-	SHIM_LOG("FUXI_BYPASS_SWIZZLED\n");
+}
+
+static void *poller(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 3000; i++) {   /* up to ~30 s at 10 ms */
+		Class c = objc_getClass("LSInstallProgressService");
+		if (c) {
+			swizzle(c);
+			SHIM_LOG("FUXI_BYPASS_SWIZZLED\n");
+			return (void *)0;
+		}
+		usleep(10000);
+	}
+	SHIM_LOG("FUXI_BYPASS_CLASS_TIMEOUT\n");
+	return (void *)0;
+}
+
+__attribute__((constructor))
+static void shim_init(void)
+{
+	SHIM_LOG("FUXI_BYPASS_LOADED\n");
+	unsigned long t;
+	if (pthread_create(&t, 0, poller, 0) != 0) {
+		SHIM_LOG("FUXI_BYPASS_THREAD_FAIL\n");
+		/* last resort: try once synchronously */
+		Class c = objc_getClass("LSInstallProgressService");
+		if (c) {
+			swizzle(c);
+			SHIM_LOG("FUXI_BYPASS_SWIZZLED\n");
+		}
+	}
+	/* detached: we never join */
 }
