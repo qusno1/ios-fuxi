@@ -64,7 +64,7 @@ static void *poller(void *arg)
 {
 	(void)arg;
 	for (int i = 0; i < 3000; i++) {   /* up to ~30 s at 10 ms */
-		Class c = objc_getClass("LSInstallProgressService");
+		Class c = (Class)objc_getClass("LSInstallProgressService");
 		if (c) {
 			swizzle(c);
 			SHIM_LOG("FUXI_BYPASS_SWIZZLED\n");
@@ -84,7 +84,7 @@ static void shim_init(void)
 	if (pthread_create(&t, 0, poller, 0) != 0) {
 		SHIM_LOG("FUXI_BYPASS_THREAD_FAIL\n");
 		/* last resort: try once synchronously */
-		Class c = objc_getClass("LSInstallProgressService");
+		Class c = (Class)objc_getClass("LSInstallProgressService");
 		if (c) {
 			swizzle(c);
 			SHIM_LOG("FUXI_BYPASS_SWIZZLED\n");
