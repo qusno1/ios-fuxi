@@ -177,7 +177,7 @@ static int gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len);
 #define GX_LOGICAL_Y 2436u
 
 static struct {
-	vm_offset_t se, gcc, tlmm, gpi, smmu, gsi;
+	vm_offset_t se, gcc, tlmm, gpi, smmu, gsi, qwrap;
 	vm_offset_t dma;
 	uint64_t dma_pa;
 	unsigned wp[2], evrp;
@@ -488,6 +488,14 @@ gx_gpi_init(void)
 #define GX_DMA_RX_IRQ_SET ((1u << 4) | (1u << 3) | (1u << 2) | (1u << 0))
 #define GX_SE_GSI_EVENT_EN 0x3u
 
+/* QUP wrapper common block (HPG 3.1.2): the SE AHB master clock gate must be
+ * on before ANY access to the SE firmware/config register regions — without
+ * it the FW-region writes take a bus error (QUPV3_SE_AHB_M_CFG @ wrapper
+ * 0xac0000 + 0x118; QUPV3_COMMON_CFG @ +0x120). */
+#define GX_QUP1_WRAP_PA   0x00ac0000u
+#define QUP_SE_AHB_M_CFG  0x118u
+#define QUP_COMMON_CFG    0x120u
+
 /* QUPv3 GSI_TOP (coreboot gsi_regs) and the GSI MCS firmware load. */
 #define GX_GSI_TOP_PA 0x00a00000u
 #define GSI_CFG 0x0000u
@@ -523,9 +531,21 @@ gx_se_fw_load(void)
 	if (((fw >> 8) & 0xff) == GX_SEFW_PROTO) {
 		return 0;                       /* I2C firmware already resident */
 	}
+	/* HPG 3.1.2: the wrapper AHB master clock gate must be on before any
+	 * FW-region access, or the writes take a bus error. */
+	if (!gx.qwrap) {
+		gx.qwrap = ml_io_map(GX_QUP1_WRAP_PA, 0x200u);
+		if (!gx.qwrap) {
+			return ENOMEM;
+		}
+	}
+	gx_wr(gx.qwrap, QUP_SE_AHB_M_CFG, gx_rd(gx.qwrap, QUP_SE_AHB_M_CFG) | 1u);
+	gx_wr(gx.qwrap, QUP_COMMON_CFG, gx_rd(gx.qwrap, QUP_COMMON_CFG) | 1u);
+	printf("GX TOUCH: wrapper AHB M gate on\n");
 	/* unlock the SE for firmware loading */
 	gx_wr(gx.se, SE_FW_MULTILOCK_PROTS, 0);
 	gx_wr(gx.se, SE_FW_MULTILOCK_MSA, 0);
+	printf("GX TOUCH: fw multilock unlocked\n");
 	/* stop the core and clock the program RAM */
 	gx_wr(gx.se, GENI_OUTPUT_CTRL, 0);
 	gx_wr(gx.se, GENI_DFS_IF_CFG, gx_rd(gx.se, GENI_DFS_IF_CFG) & ~1u);
@@ -542,6 +562,7 @@ gx_se_fw_load(void)
 		gx_wr(gx.se, SE_GENI_CFG_REG0 + gx_sefw_cfg_idx[i] * 4,
 		    gx_sefw_cfg_val[i]);
 	}
+	printf("GX TOUCH: fw cfg array written\n");
 	gx_wr(gx.se, GENI_OUTPUT_CTRL,
 	    gx_rd(gx.se, GENI_OUTPUT_CTRL) | DEFAULT_IO_OUTPUT_CTRL);
 	/* GPI-DMA mode with the GSI event path */
@@ -558,6 +579,7 @@ gx_se_fw_load(void)
 	for (unsigned i = 0; i < GX_SEFW_WORDS_N; i++) {
 		gx_wr(gx.se, SE_GENI_CFG_RAMN + 4 * i, gx_sefw_words[i]);
 	}
+	printf("GX TOUCH: fw program RAM written\n");
 	/* restart the program RAM, then the serial engine clock */
 	gx_wr(gx.se, GENI_FORCE_DEFAULT, 1);
 	gx_wr(gx.se, GENI_CGC_CTRL, gx_rd(gx.se, GENI_CGC_CTRL) | GX_CGC_PROG_RAM_OFF);
@@ -604,6 +626,7 @@ gx_gsi_fw_load(void)
 		gx_wr(gx.gsi, GSI_INST_RAMN + 8 * i, gx_gsi_lines[2 * i]);
 		gx_wr(gx.gsi, GSI_INST_RAMN + 8 * i + 4, gx_gsi_lines[2 * i + 1]);
 	}
+	printf("GX TOUCH: GSI IRAM written\n");
 	gx_wr(gx.gsi, GSI_MCS_CFG, gx_rd(gx.gsi, GSI_MCS_CFG) | 1u);
 	gx_wr(gx.gsi, GSI_CFG, gx_rd(gx.gsi, GSI_CFG) | (1u << 2) | 1u);
 	gx_wr(gx.gsi, GSI_EE_N_SCRATCH_0, 0);
