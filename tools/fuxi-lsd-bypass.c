@@ -46,17 +46,17 @@ static id stub_recover(id self, SEL _cmd)
 
 static void swizzle(Class c)
 {
-	SEL s1 = sel_registerName("performJournalRecovery");
-	SEL s2 = sel_registerName("dispatchJournalledNotificationsToConnectedClients");
-	void *m1 = class_getInstanceMethod(c, s1);
-	void *m2 = class_getInstanceMethod(c, s2);
-	if (m1) {
-		orig_recover = method_getImplementation(m1);
-		method_setImplementation(m1, (IMP)stub_recover);
-	}
-	if (m2) {
-		orig_dispatch_journal = method_getImplementation(m2);
-		method_setImplementation(m2, (IMP)stub_recover);
+	const char *names[] = {
+		"performJournalRecovery",
+		"dispatchJournalledNotificationsToConnectedClients",
+		"restoreInactiveInstalls",   /* MG client query hangs without SEP/baseband */
+	};
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		SEL s = sel_registerName(names[i]);
+		void *m = class_getInstanceMethod(c, s);
+		if (m) {
+			method_setImplementation(m, (IMP)stub_recover);
+		}
 	}
 }
 
