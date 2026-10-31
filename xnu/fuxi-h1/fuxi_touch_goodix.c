@@ -80,6 +80,20 @@ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
 #define GX_TRE_FLAGS_IEOT  (1u << 9)
 #define GX_GO_FLAGS  (GX_TRE_TYPE_GO << 16 | GX_TRE_FLAGS_CHAIN)
 #define GX_DMA_FLAGS (GX_TRE_TYPE_DMA << 16 | GX_TRE_FLAGS_IEOT)
+#define GX_I2C_WRITE 1u
+#define GX_I2C_READ  2u
+#define GX_GO(op, addr, stretch) ((op) | ((addr) << 8) | ((stretch) ? (1u << 26) : 0))
+
+static void gx_sleep_until(uint64_t deadline)
+{
+	(void)assert_wait_deadline_with_leeway(&gx_chan, THREAD_UNINT,
+	    TIMEOUT_URGENCY_SYS_CRITICAL, deadline, 0);
+	thread_block(THREAD_CONTINUE_NULL);
+}
+
+/* The Goodix protocol layer's helpers (chunking lives in gx_i2c_read). */
+static int gx_i2c_read_reg(uint32_t reg, uint8_t *out, unsigned len);
+static int gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len);
 
 /* GENI serial engine registers (UniXNU GeniI2c.h, BSD-2-Clause-Patent). */
 #define GENI_FW_REVISION 0x068u
@@ -551,6 +565,18 @@ gx_i2c_read(uint32_t reg, uint8_t *out, unsigned len)
 	gx_dma_sync(GX_RXB_OFF, len);
 	memcpy(out, (const void *)(gx.dma + GX_RXB_OFF), len);
 	return 0;
+}
+
+static int
+gx_i2c_read_reg(uint32_t reg, uint8_t *out, unsigned len)
+{
+	return gx_i2c_read(reg, out, len);
+}
+
+static int
+gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len)
+{
+	return gx_i2c_write(reg, data, len);
 }
 
 static uint16_t
