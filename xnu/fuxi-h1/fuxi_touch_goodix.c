@@ -55,7 +55,8 @@ extern pmap_t kernel_pmap;
 #define GX_SE_PA     0x00a90000u
 #define GX_GCC_PA    0x00100000u
 #define GX_TLMM_PA   0x0f100000u
-#define GX_GPI_PA    0x00a10000u   /* GPII 0: ee base 0x9f0000 + 0x20000 */
+/* The GPII window base is probed at init (see gx_gpi_init): mainline puts it
+ * at engine + 0x20000; the fuxi-era +0x10000 value is the fallback. */
 #define GX_SMMU_PA   0x15000000u
 #define GX_GPIO(n)   ((uint32_t)(n) * 0x1000u)
 #define GX_RESET     24u
@@ -341,14 +342,10 @@ gx_smmu(void)
 	return 0;
 }
 
-/* GPI channel setup: the FTS wroll with the I2C protocol encoding.
- * CNTXT_0 PROTO: QCOM_GPI_I2C = 1 (the FTS used 2 = SPI); SCRATCH_0 PROTO:
- * GENI_SE_I2C = 3 (the FTS used 1 = SPI); PAIR/SEID unchanged. */
-static int
-gx_gpi_init(void)
+/* GPI teardown: stop, reset and free the channels and the event ring. */
+static void
+gx_gpi_teardown(void)
 {
-	uint32_t lo = (uint32_t)gx.dma_pa, hi = (uint32_t)(gx.dma_pa >> 32);
-	/* The loader may leave channels started: stop, reset, free. */
 	for (unsigned k = 0; k < 2; k++) {
 		if (gx_state(GPI_CH(k)) == 2) {
 			(void)gx_gpi_cmd(0x08, (2u << 24) | k, GPI_CH(k), 3);
@@ -364,6 +361,16 @@ gx_gpi_init(void)
 		gx_wr(gx.gpi, GPI_GPII + 0x10, 10u << 24);
 		delay(1000);
 	}
+}
+
+/* GPI setup against the mapped window: the FTS engine-level wroll, the event
+ * ring, both channels with the I2C encodings, then START. CNTXT_0 PROTO is
+ * the channel TYPE (GPI_CHTYPE_PROTO_GPI = 2, mainline gpi_alloc_chan); the
+ * peripheral protocol (QCOM_GPI_I2C = 3) lives in SCRATCH_0 only. */
+static int
+gx_gpi_setup(void)
+{
+	uint32_t lo = (uint32_t)gx.dma_pa, hi = (uint32_t)(gx.dma_pa >> 32);
 	bzero((void *)gx.dma, PAGE_SIZE);
 	gx_dma_sync(0, PAGE_SIZE);
 	gx_wr(gx.gpi, GPI_GPII + 0x88, 0x4f);
@@ -413,10 +420,36 @@ gx_gpi_init(void)
 	}
 	for (unsigned k = 0; k < 2; k++) {
 		if (!gx_gpi_cmd(0x08, (1u << 24) | k, GPI_CH(k), 2)) {
+			printf("GX TOUCH: ch%u start fail CNTXT_0 %#x scratch %#x\n", k,
+			    gx_rd(gx.gpi, GPI_CH(k)), gx_rd(gx.gpi, GPI_CH(k) + 0x60));
 			return EIO;
 		}
 	}
 	return 0;
+}
+
+/* The QUP1 GPI engine sits at 0xa00000 (vermeer live.dtb gpi-dma@a00000) and
+ * mainline gpi.c places the GPII windows at engine + 0x20000. The FTS's
+ * 0xa10000 is the FUXI engine base (0x9f0000) + 0x20000 — probe both, the
+ * window whose channel state machine actually responds wins. */
+static int
+gx_gpi_init(void)
+{
+	static const uintptr_t bases[] = { 0x00a20000u, 0x00a10000u };
+	for (unsigned i = 0; i < sizeof(bases) / sizeof(bases[0]); i++) {
+		gx.gpi = ml_io_map(bases[i], 0x4000);
+		if (!gx.gpi) {
+			continue;
+		}
+		gx_gpi_teardown();
+		if (gx_gpi_setup() == 0) {
+			printf("GX TOUCH: GPI window %#x\n", (uint32_t)bases[i]);
+			return 0;
+		}
+		gx_gpi_teardown();
+	}
+	gx.gpi = 0;
+	return EIO;
 }
 
 /* SE: select the I2C firmware and enable the interface. */
@@ -771,9 +804,8 @@ gx_thread(void *arg, wait_result_t result)
 	gx.gcc = ml_io_map(GX_GCC_PA, 0x1f0000);
 	gx.tlmm = ml_io_map(GX_TLMM_PA, 0x30000);
 	gx.se = ml_io_map(GX_SE_PA, 0x4000);
-	gx.gpi = ml_io_map(GX_GPI_PA, 0x4000);
 	gx.smmu = ml_io_map(GX_SMMU_PA, 0x1000);
-	if (!gx.gcc || !gx.tlmm || !gx.se || !gx.gpi || !gx.smmu) {
+	if (!gx.gcc || !gx.tlmm || !gx.se || !gx.smmu) {
 		goto out;
 	}
 	if (kmem_alloc_contig(kernel_map, &gx.dma, PAGE_SIZE, PAGE_MASK, 0, 0,
