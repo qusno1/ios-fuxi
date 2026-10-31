@@ -107,7 +107,9 @@ static int gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len);
 #define GENI_FW_REVISION 0x068u
 #define GENI_IF_DISABLE  0x064u
 #define GENI_CLK_CFG     0x048u
-#define GENI_CLK_SEL     0x040u
+/* GENI_CLK_SEL (0x7c) carries PROTOCOL_ID; 0x40 is the read-only
+ * SE_GENI_STATUS (the FTS-era define had them swapped). */
+#define GENI_CLK_SEL     0x07cu
 #define GENI_BYTE_GRAN   0x254u
 #define GENI_DMA_MODE    0x258u
 #define GENI_TX_PACK0    0x260u
@@ -459,8 +461,15 @@ gx_se_init(void)
 	if (gx_rd(gx.se, GENI_IF_DISABLE) & 1u) {
 		gx_wr(gx.se, GENI_IF_DISABLE, 0);
 	}
+	/* The ABL leaves this SE in SPI firmware (fw 0x102 — the FTS-era
+	 * drivers accepted proto 1 = SPI and left it); select the I2C ROM via
+	 * GENI_CLK_SEL.PROTOCOL_ID and wait for FW_REVISION_RO to switch. */
 	gx_wr(gx.se, GENI_CLK_SEL, GENI_PROTO_I2C);
 	uint32_t fw = gx_rd(gx.se, GENI_FW_REVISION);
+	for (unsigned i = 0; ((fw >> 8) & 0xff) != 3u && i < 50000; i++) {
+		delay(1);
+		fw = gx_rd(gx.se, GENI_FW_REVISION);
+	}
 	if (((fw >> 8) & 0xff) != 3u || (gx_rd(gx.se, 0x040) & 1)) {
 		printf("GX TOUCH: SE4 fw %#x status %#x: not idle I2C\n", fw,
 		    gx_rd(gx.se, 0x040));
