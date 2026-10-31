@@ -87,6 +87,8 @@ extern pmap_t kernel_pmap;
 #define GX_I2C_READ  2u
 #define GX_GO(op, addr, stretch) ((op) | ((addr) << 8) | ((stretch) ? (1u << 26) : 0))
 
+static int gx_chan;
+
 static void gx_sleep_until(uint64_t deadline)
 {
 	(void)assert_wait_deadline_with_leeway(&gx_chan, THREAD_UNINT,
@@ -169,7 +171,6 @@ static int gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len);
 #define GX_LOGICAL_X 1125u
 #define GX_LOGICAL_Y 2436u
 
-static int gx_chan;
 static struct {
 	vm_offset_t se, gcc, tlmm, gpi, smmu;
 	vm_offset_t dma;
