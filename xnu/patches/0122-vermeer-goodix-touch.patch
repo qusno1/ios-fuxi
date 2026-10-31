@@ -10,7 +10,7 @@
  bsd/dev/fuxi_keys.c			standard
 --- /dev/null
 +++ b/bsd/dev/fuxi_touch_goodix.c
-@@ -0,0 +1,889 @@
+@@ -0,0 +1,895 @@
 +/* Goodix GT9916 (Berlin) touch over GENI I2C FIFO mode — Redmi K70 (vermeer).
 + *
 + * Wire protocol per the mainline Linux goodix_berlin driver (GPL-2.0, read as
@@ -94,7 +94,9 @@
 +#define GX_TRE_TYPE_DMA  0x10u
 +#define GX_TRE_FLAGS_CHAIN (1u << 0)
 +#define GX_TRE_FLAGS_IEOT  (1u << 9)
++#define GX_TRE_FLAGS_LINK  (1u << 11)
 +#define GX_GO_FLAGS  (GX_TRE_TYPE_GO << 16 | GX_TRE_FLAGS_CHAIN)
++#define GX_GO_FLAGS_LINK (GX_TRE_TYPE_GO << 16 | GX_TRE_FLAGS_LINK)
 +#define GX_DMA_FLAGS (GX_TRE_TYPE_DMA << 16 | GX_TRE_FLAGS_IEOT)
 +#define GX_I2C_WRITE 1u
 +#define GX_I2C_READ  2u
@@ -406,13 +408,15 @@
 +		if (!gx_gpi_cmd(0x08, k, GPI_CH(k), 1)) {
 +			return EIO;
 +		}
-+		/* CNTXT_0: PROTO = QCOM_GPI_I2C (1); TX channel sets DIR. */
-+		gx_wr(gx.gpi, GPI_CH(k) + 0x00, k ? 0x10000001u : 0x10000009u);
++		/* CNTXT_0: PROTO = GPI_CHTYPE_PROTO_GPI (2) — the channel TYPE
++		 * field, not the peripheral protocol (SCRATCH_0 carries that);
++		 * EL_SIZE = 16 (sizeof TRE); TX channel sets DIR. */
++		gx_wr(gx.gpi, GPI_CH(k) + 0x00, k ? 0x10000002u : 0x1000000au);
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x04, GX_RING * 16);
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x08, lo + GX_RING_OFF(k));
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x0c, hi);
 +		gx_wr(gx.gpi, GPI_CHDB(k) + 4, hi);
-+		/* SCRATCH_0: pair, SE proto GENI_SE_I2C (3), SE 4. */
++		/* SCRATCH_0: pair, proto QCOM_GPI_I2C (3), SE 4. */
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x60, k ? 0x00000034u : 0x00010034u);
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x64, 0);
 +		gx_wr(gx.gpi, GPI_CH(k) + 0x68, 0);
@@ -561,7 +565,8 @@
 +	txb[2] = (uint8_t)(reg >> 8);
 +	txb[3] = (uint8_t)reg;
 +	gx_dma_sync(GX_TXB_OFF, 4);
-+	gx_tre(0, GX_GO(GX_I2C_WRITE, 0x5d, false), 0, 0, GX_GO_FLAGS);
++	/* reg-addr write holds the bus (stretch) for the repeated-start read */
++	gx_tre(0, GX_GO(GX_I2C_WRITE, 0x5d, true), 0, 0, GX_GO_FLAGS);
 +	gx_tre(0, (uint32_t)gx.dma_pa + GX_TXB_OFF, (uint32_t)(gx.dma_pa >> 32), 4,
 +	    GX_DMA_FLAGS);
 +	gx_ring_db(0);
@@ -574,7 +579,8 @@
 +	gx_dma_sync(GX_RXB_OFF, len);
 +	gx_tre(1, (uint32_t)gx.dma_pa + GX_RXB_OFF, (uint32_t)(gx.dma_pa >> 32), len,
 +	    GX_DMA_FLAGS);
-+	gx_tre(0, GX_GO(GX_I2C_READ, 0x5d, false), 0, len, GX_GO_FLAGS);
++	/* read GO links to the paired RX-channel DMA (Linux gpi.c multi_msg) */
++	gx_tre(0, GX_GO(GX_I2C_READ, 0x5d, false), 0, len, GX_GO_FLAGS_LINK);
 +	gx_ring_db(1);
 +	gx_ring_db(0);
 +	if ((err = gx_gpi_wait(1, &dlen))) {
