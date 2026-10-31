@@ -10,7 +10,7 @@
  bsd/dev/fuxi_keys.c			standard
 --- /dev/null
 +++ b/bsd/dev/fuxi_touch_goodix.c
-@@ -0,0 +1,884 @@
+@@ -0,0 +1,888 @@
 +/* Goodix GT9916 (Berlin) touch over GENI I2C FIFO mode — Redmi K70 (vermeer).
 + *
 + * Wire protocol per the mainline Linux goodix_berlin driver (GPL-2.0, read as
@@ -63,10 +63,13 @@
 +extern void fuxi_perf_input(void);
 +extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 +extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern pmap_t kernel_pmap;
 +
 +#define GX_SE_PA     0x00a90000u
 +#define GX_GCC_PA    0x00100000u
 +#define GX_TLMM_PA   0x0f100000u
++#define GX_GPI_PA    0x00a10000u   /* GPII 0: ee base 0x9f0000 + 0x20000 */
++#define GX_SMMU_PA   0x15000000u
 +#define GX_GPIO(n)   ((uint32_t)(n) * 0x1000u)
 +#define GX_RESET     24u
 +#define GX_IRQ       25u
@@ -179,6 +182,7 @@
 +#define GX_LOGICAL_X 1125u
 +#define GX_LOGICAL_Y 2436u
 +
++static int gx_chan;
 +static struct {
 +	vm_offset_t se, gcc, tlmm, gpi, smmu;
 +	vm_offset_t dma;

@@ -50,10 +50,13 @@ extern thread_t current_thread(void);
 extern void fuxi_perf_input(void);
 extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+extern pmap_t kernel_pmap;
 
 #define GX_SE_PA     0x00a90000u
 #define GX_GCC_PA    0x00100000u
 #define GX_TLMM_PA   0x0f100000u
+#define GX_GPI_PA    0x00a10000u   /* GPII 0: ee base 0x9f0000 + 0x20000 */
+#define GX_SMMU_PA   0x15000000u
 #define GX_GPIO(n)   ((uint32_t)(n) * 0x1000u)
 #define GX_RESET     24u
 #define GX_IRQ       25u
@@ -166,6 +169,7 @@ static int gx_i2c_write_reg(uint32_t reg, const uint8_t *data, unsigned len);
 #define GX_LOGICAL_X 1125u
 #define GX_LOGICAL_Y 2436u
 
+static int gx_chan;
 static struct {
 	vm_offset_t se, gcc, tlmm, gpi, smmu;
 	vm_offset_t dma;
