@@ -460,8 +460,12 @@ gx_gpi_init(void)
  * switches protocols on its own (the ABL leaves the SPI blob resident). */
 #define GENI_INIT_CFG_REVISION  0x000u
 #define GENI_S_INIT_CFG_REVISION 0x004u
+#define GENI_FORCE_DEFAULT      0x020u
+#define GENI_OUTPUT_CTRL        0x024u
+#define GENI_CGC_CTRL           0x028u
 #define GENI_DFS_IF_CFG         0x080u
 #define SE_GENI_CFG_REG0        0x100u
+#define SE_DMA_GENERAL_CFG      0xe30u
 #define SE_GENI_FW_REVISION     0x1000u
 #define SE_GENI_S_FW_REVISION   0x1004u
 #define SE_GENI_CFG_RAMN        0x1010u
