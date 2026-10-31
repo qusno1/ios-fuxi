@@ -476,6 +476,7 @@ gx_gpi_init(void)
 #define SE_FW_MULTILOCK_MSA     0x2010u
 #define SE_DMA_TX_IRQ_EN_SET    0xc4cu
 #define SE_DMA_RX_IRQ_EN_SET    0xd4cu
+#define GENI_S_IRQ_EN           0x644u
 #define SE_GSI_EVENT_EN         0xe18u
 #define GX_CGC_PROG_RAM_OFF ((1u << 9) | (1u << 8))
 #define DEFAULT_CGC_EN 0x7fu
