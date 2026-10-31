@@ -136,3 +136,24 @@ pinctrl node — extract from the dump tgz `live-dt` when needed; sheng used
   enabling the rails via SPMI (see sweet_spmi.c) with the DTB phandle voltages
   decoded from the dump.
 - Coordinate orientation: `invert_xy` exists in the DT — check both.
+
+## I2C GPI DMA TRE format (Linux gpi.c reference, saved at goodix-ref/gpi.c)
+
+Transfer = 2-3 TREs in the GPI ring (same rings the FTS driver uses):
+
+1. **CONFIG TRE** (TRE_TYPE_CONFIG0, optional, once per bus speed):
+   dword0 = tlow[7:0] | thigh[15:8] | tcyl[23:16] | tx_pack BIT24 | rx_pack BIT25
+   dword2 = clk_div[11:0]
+   dword3 = TYPE_CONFIG0 << 16 | CHAIN
+2. **GO TRE** (TRE_TYPE_GO):
+   dword0 = op[4:0] (I2C_WRITE / I2C_READ from qcom-gpi-dma.h) | addr[14:8] |
+            STRETCH BIT26 (repeated start, for the reg-address phase)
+   dword2 = rx_len (for reads)
+   dword3 = TYPE_GO << 16 | CHAIN (or LINK for multi-msg)
+3. **DMA TRE** (TRE_TYPE_DMA, carries the data buffer):
+   dword0/1 = buffer PA, dword2 = len[23:0], dword3 = TYPE_DMA << 16 | IEOT
+
+Write = GO(WRITE, addr) + DMA(data).  Read = GO(READ, addr, STRETCH, rx_len=N) +
+DMA(rx buffer) — the reg-address bytes ride in the data buffer.
+
+Reference: goodix-ref/gpi.c (gpi_create_i2c_tre), goodix-ref/qcom-gpi-dma.h.
