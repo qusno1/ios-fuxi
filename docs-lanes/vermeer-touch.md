@@ -49,7 +49,33 @@ protocol.
     >2 touches (`(n-2)*8` more), then clear status: `regmap_write(touch_data_addr, 0)`.
 - Max 10 touches.
 
-## Transport work (UniXNU GeniI2c.c extension)
+## ⚠️ CRITICAL: FIFO mode is hardware-disabled on this SE (measured)
+
+The on-device capture (goodix=1 boot, monitor-root26) shows the engine at
+`fw rev 0x102` = **SPI proto selected** + `FIFO_IF_DISABLE=1`. UniXNU's
+TouchProbe.cpp documents this exact hardware (v53-v55 SE revision):
+
+> "FIFO_IF_DISABLE=1 and the register that controls it (0x2008) aborts on
+> access, so FIFO transfers cannot be used; the SE DMA engine is the
+> host-visible path."
+
+The first FIFO-mode driver (fuxi_touch_goodix.c v1, 0122) is therefore
+dead on this SE — kept in git history as the protocol reference. The working
+path is **GPI DMA mode with I2C TREs**, reusing the FTS driver's proven
+machinery (the same engine, the same GPII0 channels, the same SMMU SMRs —
+fuxi_touch.c's ft_gpi_init/ft_tx/ft_read, ~80% reusable):
+
+1. SE proto: the engine must be switched to I2C (GENI_CLK_SEL = 3) — the FTS
+   driver left it in SPI; a warm reset may or may not restore I2C (measured:
+   fw rev 0x102 = SPI after a warm XNU→Android→XNU cycle — the SE proto
+   survives warm resets; the driver must switch it explicitly).
+2. The GPI DMA TREs change from SPI to I2C format (Linux gpi.c is the
+   reference: drivers/dma/qcom/gpi.c, the I2C TRE structures — fetch and
+   port; the FTS ft_tre() builder is the pattern).
+3. The Goodix Berlin protocol layer stays (32-bit BE reg addresses as I2C
+   payload bytes; the event/checksum structures are unchanged).
+
+## Transport work (superseded: UniXNU GeniI2c.c FIFO extension — unusable)
 
 UniXNU `package/GeniI2c.c` (BSD-2-Clause-Patent) is a polled state machine for
 **1-byte register read/write** on an SE already in GENI-I2C mode. Needed
