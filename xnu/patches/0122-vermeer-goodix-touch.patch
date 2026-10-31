@@ -661,13 +661,14 @@
 +}
 --- a/bsd/dev/fuxi_touch.c
 +++ b/bsd/dev/fuxi_touch.c
-@@ -780,6 +780,13 @@
+@@ -780,6 +780,14 @@
  	}
  	ft.started = true;
  	(void)PE_parse_boot_argn("fuxitouch", &enabled, sizeof(enabled));
 +	int goodix = 0;
 +	(void)PE_parse_boot_argn("fuxitouch_goodix", &goodix, sizeof(goodix));
 +	if (goodix) {
++		extern void fuxi_touch_goodix_init(void);
 +		/* vermeer: Goodix GT9916 over GENI I2C (fuxi_touch_goodix.c) */
 +		fuxi_touch_goodix_init();
 +		return;
