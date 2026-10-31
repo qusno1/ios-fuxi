@@ -36,6 +36,10 @@
 
 extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
 extern kern_return_t thread_terminate(thread_t);
+extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation,
+    void *parameter, integer_t priority, thread_t *new_thread);
+extern thread_t current_thread(void);
+extern void fuxi_perf_input(void);
 extern void sweet_hid_touch(int finger, int down, int x, int y);
 extern int sweet_fb_display_off;       /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern void fuxi_touch_goodix_init(void);
@@ -528,7 +532,6 @@ out_clear:
 }
 }
 
-extern void fuxi_perf_input(void);
 static void
 gx_thread(void *arg, wait_result_t result)
 {
