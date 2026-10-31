@@ -818,40 +818,26 @@ gx_thread(void *arg, wait_result_t result)
 		goto out;
 	}
 	gx.dma_pa = ptoa_64(pn);
-	{
-		int ierr;
-		if ((ierr = gx_smmu()) || (ierr = gx_gpi_init())) {
-			printf("GX TOUCH: init (smmu/gpi) failed %d\n", ierr);
-			goto out;
-		}
-	}
+	/* The FTS bring-up order: SE first (I2C firmware + GPI-DMA mode), then
+	 * SMMU, then the GPI channels — the engine refuses channel START while
+	 * the target SE is not in DMA mode. gx_clock's votes are fuxi GCC
+	 * offsets — deliberately not run here (the loader leaves QUP1 clocked,
+	 * the SE reads back its I2C firmware revision without them). */
+	(void)gx_clock;
 	int ierr;
-	if ((ierr = gx_clock())) {
-		printf("GX TOUCH: clock failed %d\n", ierr);
+	if ((ierr = gx_se_init())) {
+		printf("GX TOUCH: se init failed %d\n", ierr);
 		goto out;
 	}
-	/* select the I2C firmware and confirm the engine runs it */
-	gx_wr(gx.se, GENI_CLK_SEL, GENI_PROTO_I2C);
-	uint32_t fwrev = gx_rd(gx.se, GENI_FW_REVISION);
-	if (((fwrev >> 8) & 0xffu) != GENI_PROTO_I2C || (gx_rd(gx.se, GENI_IF_DISABLE) & 1u)) {
-		printf("GX TOUCH: engine not I2C (fw rev %#x, disable %#x)\n",
-		    fwrev, gx_rd(gx.se, GENI_IF_DISABLE));
+	if ((ierr = gx_smmu()) || (ierr = gx_gpi_init())) {
+		printf("GX TOUCH: init (smmu/gpi) failed %d\n", ierr);
 		goto out;
 	}
 	if (!(gx_rd(gx.se, GENI_CLK_CFG) & 1u) || !gx_rd(gx.se, GENI_SCL_COUNTERS)) {
 		printf("GX TOUCH: I2C clocking missing\n");
 		goto out;
 	}
-	gx_wr(gx.se, GENI_DMA_MODE, 0);   /* FIFO mode */
-	gx_wr(gx.se, GENI_TX_PACK0, 0x7f8fe);
-	gx_wr(gx.se, GENI_TX_PACK1, 0xffefe);
-	gx_wr(gx.se, GENI_RX_PACK0, 0x7f8fe);
-	gx_wr(gx.se, GENI_RX_PACK1, 0xffefe);
-	gx_wr(gx.se, GENI_BYTE_GRAN, 0);
-	gx_wr(gx.se, GENI_M_IRQ_CLEAR, 0xffffffffu);
-	gx_wr(gx.se, GENI_M_IRQ_EN, GENI_M_IRQ_WANTED);
-	gx_wr(gx.se, GENI_SE_IRQ_EN, gx_rd(gx.se, GENI_SE_IRQ_EN) | GENI_SE_M_IRQ_EN);
-	printf("GX TOUCH: engine up (fw rev %#x)\n", fwrev);
+	printf("GX TOUCH: engine up (fw rev %#x)\n", gx_rd(gx.se, GENI_FW_REVISION));
 
 	/* reset: GPIO 24 high 2 ms (active high per the DT flags 0), then 100 ms */
 	gx_gpio(GX_RESET, 0, 3, 8, 1);
